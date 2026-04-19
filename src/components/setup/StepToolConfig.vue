@@ -69,6 +69,20 @@ function getDefaultForType(type: string): ProfileValue {
   return '';
 }
 
+function initVarValues(
+  fields: Record<string, { default?: unknown }> | undefined,
+  stored: Record<string, string> | undefined,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  if (fields) {
+    for (const [key, field] of Object.entries(fields)) {
+      if (field.default != null) values[key] = String(field.default);
+    }
+  }
+  if (stored) Object.assign(values, stored);
+  return values;
+}
+
 function initArgValues(
   schema: JsonSchema | null,
   storedValues?: Record<string, unknown> | null,
@@ -143,7 +157,7 @@ onMounted(async () => {
         displayName: tool.name,
         isSkill: tool.tool_type === 'skill',
         configFields: { ...(tool.required_fields ?? {}) },
-        configValues: { ...(tool.config?.variables ?? {}), ...toolConf },
+        configValues: { ...initVarValues(tool.required_fields, tool.config?.variables), ...toolConf },
         argumentsSchema: schema,
         argValues: initArgValues(schema, tool.config?.arguments),
         description: tool.description || metaCfg.description || '',

@@ -220,6 +220,8 @@ export interface ToolConfigField {
   type: string;
   secret: boolean;
   configured: boolean;
+  enum?: string[];
+  default?: unknown;
 }
 
 export interface ToolStatus {

@@ -17,17 +17,46 @@ const emit = defineEmits<{
 const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModels();
 
 const providers = ref<ProviderWithState[]>([]);
-const selectedDefaultProvider = ref(props.config.default_provider || 'groq');
+const highProvider = ref(extractProvider(props.config['model_group.high']) || props.config.default_provider || 'groq');
+const lowProvider = ref(extractProvider(props.config['model_group.low']) || props.config.default_provider || 'groq');
 const modelGroupHigh = ref(props.config['model_group.high'] || '');
 const modelGroupLow = ref(props.config['model_group.low'] || '');
 const reasoningEffortHigh = ref(props.config['model_group.high.reasoning_effort'] || '');
 const reasoningEffortLow = ref(props.config['model_group.low.reasoning_effort'] || '');
 const loading = ref(false);
 
-const filteredModels = computed(() => getFilteredModels(selectedDefaultProvider.value));
+/** Extract provider name from a model group value like "groq/mixtral-8x7b". */
+function extractProvider(groupValue: string | undefined): string {
+  if (!groupValue) return '';
+  const idx = groupValue.indexOf('/');
+  return idx > 0 ? groupValue.substring(0, idx) : groupValue;
+}
+
+const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
+const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
 
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroupHigh.value));
 const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroupLow.value));
+
+// When provider changes, clear model selection if current model doesn't belong to new provider
+watch(highProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroupHigh.value);
+    if (currentProvider !== newProvider) {
+      modelGroupHigh.value = '';
+      reasoningEffortHigh.value = '';
+    }
+  }
+});
+watch(lowProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroupLow.value);
+    if (currentProvider !== newProvider) {
+      modelGroupLow.value = '';
+      reasoningEffortLow.value = '';
+    }
+  }
+});
 
 // Clear reasoning_effort when model changes and new model doesn't support it
 watch(modelGroupHigh, () => {
@@ -67,7 +96,8 @@ onMounted(async () => {
 
 function emitConfig() {
   const config: Record<string, string> = {
-    default_provider: selectedDefaultProvider.value,
+    // Derive default_provider from the high group's provider
+    default_provider: highProvider.value || lowProvider.value || 'groq',
   };
   if (modelGroupHigh.value) config['model_group.high'] = modelGroupHigh.value;
   if (modelGroupLow.value) config['model_group.low'] = modelGroupLow.value;
@@ -84,7 +114,7 @@ function emitConfig() {
   emit('update', config);
 }
 
-watch([selectedDefaultProvider, modelGroupHigh, modelGroupLow, reasoningEffortHigh, reasoningEffortLow], emitConfig);
+watch([highProvider, lowProvider, modelGroupHigh, modelGroupLow, reasoningEffortHigh, reasoningEffortLow], emitConfig);
 watch(providers, emitConfig, { deep: true });
 </script>
 
@@ -111,41 +141,58 @@ watch(providers, emitConfig, { deep: true });
 
     <div class="model-groups-section">
       <h4 class="section-subtitle">Model Groups</h4>
-      <p class="step-description">
-        The <strong>High</strong> group is used for reasoning. The <strong>Low</strong> group is for tool calls.
-      </p>
 
-      <ElForm label-position="top" class="groups-form">
-        <ElFormItem label="Default Provider">
-          <ElSelect v-model="selectedDefaultProvider" placeholder="Select default provider">
-            <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
-          </ElSelect>
-        </ElFormItem>
+      <!-- High Group -->
+      <div class="group-block">
+        <p class="step-description">
+          <strong>High Group</strong> — used for reasoning.
+        </p>
+        <ElForm label-position="top" class="groups-form">
+          <ElFormItem label="Provider">
+            <ElSelect v-model="highProvider" placeholder="Select provider">
+              <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+            </ElSelect>
+          </ElFormItem>
 
-        <ElFormItem label="High Group (Reasoning)">
-          <ElSelect v-model="modelGroupHigh" placeholder="Select reasoning model" filterable>
-            <ElOption v-for="m in filteredModels" :key="m.value" :label="m.label" :value="m.value" />
-          </ElSelect>
-        </ElFormItem>
+          <ElFormItem label="Model">
+            <ElSelect v-model="modelGroupHigh" placeholder="Select reasoning model" filterable>
+              <ElOption v-for="m in highFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+            </ElSelect>
+          </ElFormItem>
 
-        <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort (High Group)">
-          <ElSelect v-model="reasoningEffortHigh" placeholder="Select reasoning effort" clearable>
-            <ElOption v-for="opt in highModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
-          </ElSelect>
-        </ElFormItem>
+          <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort">
+            <ElSelect v-model="reasoningEffortHigh" placeholder="Select reasoning effort" clearable>
+              <ElOption v-for="opt in highModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
+            </ElSelect>
+          </ElFormItem>
+        </ElForm>
+      </div>
 
-        <ElFormItem label="Low Group (Tools)">
-          <ElSelect v-model="modelGroupLow" placeholder="Select tools model" filterable>
-            <ElOption v-for="m in filteredModels" :key="m.value" :label="m.label" :value="m.value" />
-          </ElSelect>
-        </ElFormItem>
+      <!-- Low Group -->
+      <div class="group-block">
+        <p class="step-description">
+          <strong>Low Group</strong> — used for tool calls.
+        </p>
+        <ElForm label-position="top" class="groups-form">
+          <ElFormItem label="Provider">
+            <ElSelect v-model="lowProvider" placeholder="Select provider">
+              <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+            </ElSelect>
+          </ElFormItem>
 
-        <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort (Low Group)">
-          <ElSelect v-model="reasoningEffortLow" placeholder="Select reasoning effort" clearable>
-            <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
-          </ElSelect>
-        </ElFormItem>
-      </ElForm>
+          <ElFormItem label="Model">
+            <ElSelect v-model="modelGroupLow" placeholder="Select tools model" filterable>
+              <ElOption v-for="m in lowFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+            </ElSelect>
+          </ElFormItem>
+
+          <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
+            <ElSelect v-model="reasoningEffortLow" placeholder="Select reasoning effort" clearable>
+              <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
+            </ElSelect>
+          </ElFormItem>
+        </ElForm>
+      </div>
     </div>
   </div>
 </template>
@@ -177,8 +224,18 @@ watch(providers, emitConfig, { deep: true });
 .model-groups-section { margin-top: 8px; }
 
 .section-subtitle {
-  font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 0 0 4px 0;
+  font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 0 0 12px 0;
 }
+
+.group-block {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border-color, #e4e7ed);
+  border-radius: 8px;
+  background: var(--surface-color, #fafafa);
+}
+
+.group-block .step-description { margin-bottom: 12px; }
 
 .groups-form { max-width: 480px; }
 </style>

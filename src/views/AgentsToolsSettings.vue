@@ -144,6 +144,20 @@ function getDefaultForType(type: string): ProfileValue {
   return '';
 }
 
+function initVarValues(
+  fields: Record<string, { default?: unknown }> | undefined,
+  stored: Record<string, string> | undefined,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  if (fields) {
+    for (const [key, field] of Object.entries(fields)) {
+      if (field.default != null) values[key] = String(field.default);
+    }
+  }
+  if (stored) Object.assign(values, stored);
+  return values;
+}
+
 function initArgValues(schema: JsonSchema | null, storedValues?: Record<string, unknown> | null): Record<string, ProfileValue> {
   if (!schema || !schema.properties) return {};
   const stored = storedValues || {};
@@ -173,7 +187,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       kind: isSkill ? 'skill' : 'builtin',
       toolName: tool.tool_id,
       toolConfigFields: { ...(tool.required_fields ?? {}) },
-      toolConfigValues: { ...(tool.config?.variables ?? {}) },
+      toolConfigValues: initVarValues(tool.required_fields, tool.config?.variables),
       toolConfigured: tool.configured,
       agentName: tool.tool_id,
       description: tool.description || metaCfg.description || '',

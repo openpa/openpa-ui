@@ -22,18 +22,49 @@ const { rebuildModelList, getFilteredModels, getReasoningOptions } = useLLMModel
 const providers = ref<ProviderWithState[]>([]);
 const modelGroups = ref<Record<string, string>>({ high: '', low: '' });
 const reasoningEfforts = ref<Record<string, string | null>>({ high: null, low: null });
-const defaultProvider = ref('groq');
+const highProvider = ref('');
+const lowProvider = ref('');
+const apiKeyProvider = ref('');
 const loading = ref(false);
 const saving = ref(false);
 
-const selectedProvider = computed(() =>
-  providers.value.find(p => p.name === defaultProvider.value) || null
+/** Extract provider name from a model group value like "groq/mixtral-8x7b". */
+function extractProvider(groupValue: string): string {
+  if (!groupValue) return '';
+  const idx = groupValue.indexOf('/');
+  return idx > 0 ? groupValue.substring(0, idx) : groupValue;
+}
+
+const selectedApiKeyProvider = computed(() =>
+  providers.value.find(p => p.name === apiKeyProvider.value) || null
 );
 
-const filteredModels = computed(() => getFilteredModels(defaultProvider.value));
+const highFilteredModels = computed(() => getFilteredModels(highProvider.value));
+const lowFilteredModels = computed(() => getFilteredModels(lowProvider.value));
 const highModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.high));
 const lowModelReasoningOptions = computed(() => getReasoningOptions(modelGroups.value.low));
 
+// When provider changes, clear model selection if the current model doesn't belong to the new provider
+watch(highProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroups.value.high);
+    if (currentProvider !== newProvider) {
+      modelGroups.value.high = '';
+      reasoningEfforts.value.high = null;
+    }
+  }
+});
+watch(lowProvider, (newProvider, oldProvider) => {
+  if (oldProvider && newProvider !== oldProvider) {
+    const currentProvider = extractProvider(modelGroups.value.low);
+    if (currentProvider !== newProvider) {
+      modelGroups.value.low = '';
+      reasoningEfforts.value.low = null;
+    }
+  }
+});
+
+// Clear reasoning effort when model changes and new model doesn't support it
 watch(() => modelGroups.value.high, () => {
   if (highModelReasoningOptions.value.length === 0) reasoningEfforts.value.high = null;
 });
@@ -57,7 +88,10 @@ onMounted(async () => {
     }));
 
     modelGroups.value = groupRes.model_groups;
-    defaultProvider.value = groupRes.default_provider;
+
+    // Initialize per-group providers from stored model group values
+    highProvider.value = extractProvider(groupRes.model_groups.high) || groupRes.default_provider || '';
+    lowProvider.value = extractProvider(groupRes.model_groups.low) || groupRes.default_provider || '';
 
     for (const p of providers.value) {
       try {
@@ -129,11 +163,13 @@ async function saveProviderConfig(provider: ProviderWithState) {
 async function saveModelGroups() {
   saving.value = true;
   try {
+    // Derive default_provider from the high group's provider
+    const derivedDefaultProvider = highProvider.value || lowProvider.value || '';
     await updateModelGroups(
       settingsStore.agentUrl,
       settingsStore.authToken,
       modelGroups.value,
-      defaultProvider.value,
+      derivedDefaultProvider,
       reasoningEfforts.value,
     );
     ElMessage.success('Model groups updated');
@@ -162,55 +198,82 @@ function goBack() {
       <div v-if="loading" class="loading-state">Loading...</div>
 
       <template v-else>
-        <!-- Model Groups -->
+        <!-- API Keys Section -->
         <div class="section">
-          <h2 class="section-title">Model Groups</h2>
-          <p class="section-description">
-            <strong>High</strong> = reasoning model. <strong>Low</strong> = tool call model.
-          </p>
+          <h2 class="section-title">API Keys</h2>
+          <p class="section-description">Configure API keys and credentials for your LLM providers.</p>
 
           <ElForm label-position="top" class="groups-form">
-            <ElFormItem label="Default Provider">
-              <ElSelect v-model="defaultProvider">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="apiKeyProvider" placeholder="Select a provider to configure">
                 <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
               </ElSelect>
             </ElFormItem>
 
-            <!-- Inline provider configuration -->
-            <div v-if="selectedProvider" class="provider-config-inline">
+            <div v-if="selectedApiKeyProvider" class="provider-config-inline">
               <ProviderConfigFields
-                :provider="selectedProvider"
+                :provider="selectedApiKeyProvider"
                 :show-configured-badge="true"
                 :show-save-buttons="true"
                 :saving="saving"
-                @save-key="saveProviderKey(selectedProvider!)"
-                @save-config="saveProviderConfig(selectedProvider!)"
+                @save-key="saveProviderKey(selectedApiKeyProvider!)"
+                @save-config="saveProviderConfig(selectedApiKeyProvider!)"
               />
             </div>
+          </ElForm>
+        </div>
 
-            <ElFormItem label="High Group (Reasoning)">
-              <ElSelect v-model="modelGroups.high" filterable>
-                <ElOption v-for="m in filteredModels" :key="m.value" :label="m.label" :value="m.value" />
+        <!-- High Group -->
+        <div class="section">
+          <h2 class="section-title">High Group (Reasoning)</h2>
+          <p class="section-description">Select the provider and model used for reasoning tasks.</p>
+
+          <ElForm label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="highProvider" placeholder="Select provider">
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
               </ElSelect>
             </ElFormItem>
-            <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort (High Group)">
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.high" filterable placeholder="Select reasoning model">
+                <ElOption v-for="m in highFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+              </ElSelect>
+            </ElFormItem>
+            <ElFormItem v-if="highModelReasoningOptions.length > 0" label="Reasoning Effort">
               <ElSelect v-model="reasoningEfforts.high" placeholder="Select reasoning effort" clearable>
                 <ElOption v-for="opt in highModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
               </ElSelect>
             </ElFormItem>
-            <ElFormItem label="Low Group (Tools)">
-              <ElSelect v-model="modelGroups.low" filterable>
-                <ElOption v-for="m in filteredModels" :key="m.value" :label="m.label" :value="m.value" />
+          </ElForm>
+        </div>
+
+        <!-- Low Group -->
+        <div class="section">
+          <h2 class="section-title">Low Group (Tools)</h2>
+          <p class="section-description">Select the provider and model used for tool calls.</p>
+
+          <ElForm label-position="top" class="groups-form">
+            <ElFormItem label="Provider">
+              <ElSelect v-model="lowProvider" placeholder="Select provider">
+                <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
               </ElSelect>
             </ElFormItem>
-            <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort (Low Group)">
+
+            <ElFormItem label="Model">
+              <ElSelect v-model="modelGroups.low" filterable placeholder="Select tools model">
+                <ElOption v-for="m in lowFilteredModels" :key="m.value" :label="m.label" :value="m.value" />
+              </ElSelect>
+            </ElFormItem>
+            <ElFormItem v-if="lowModelReasoningOptions.length > 0" label="Reasoning Effort">
               <ElSelect v-model="reasoningEfforts.low" placeholder="Select reasoning effort" clearable>
                 <ElOption v-for="opt in lowModelReasoningOptions" :key="opt" :label="opt" :value="opt" />
               </ElSelect>
             </ElFormItem>
-            <ElButton type="primary" :loading="saving" @click="saveModelGroups">Save Model Groups</ElButton>
           </ElForm>
         </div>
+
+        <ElButton type="primary" :loading="saving" @click="saveModelGroups">Save Model Groups</ElButton>
       </template>
     </div>
   </div>
@@ -247,5 +310,6 @@ function goBack() {
   border: 1px solid var(--border-color, #e4e7ed);
   border-radius: 8px;
   background: var(--surface-color, #fafafa);
+  max-width: 480px;
 }
 </style>
