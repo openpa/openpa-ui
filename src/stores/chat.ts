@@ -51,6 +51,7 @@ export interface ChatMessage {
   tokenUsage?: TokenUsage;
   latency?: LatencyInfo;
   reasoningModelLabel?: string;
+  summary?: string;
 }
 
 export interface ObservationPart {
@@ -98,6 +99,7 @@ interface ChatState {
   agentName: string;
   isConnected: boolean;
   isStreaming: boolean;
+  isSummarizing: boolean;
   error: string | null;
   conversations: SavedConversation[];
   activeConversationId: string | null;
@@ -112,6 +114,7 @@ export const useChatStore = defineStore('chat', {
     agentName: 'Agent',
     isConnected: false,
     isStreaming: false,
+    isSummarizing: false,
     error: null,
     conversations: [],
     activeConversationId: null,
@@ -287,6 +290,7 @@ export const useChatStore = defineStore('chat', {
         console.error('Error sending message:', error);
       } finally {
         this.isStreaming = false;
+        this.isSummarizing = false;
       }
     },
 
@@ -438,6 +442,18 @@ export const useChatStore = defineStore('chat', {
               totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
             };
             message.content = this.buildMessageContent(message, currentTextPart);
+            foundContent = true;
+          } else if (artifact.name === 'summary' && typeof data.summary === 'string') {
+            // Reasoning summary artifact (emitted after the Final Answer Tool)
+            message.summary = data.summary;
+            // Summary arrived; clear the summarizing indicator.
+            this.isSummarizing = false;
+            message.content = this.buildMessageContent(message, currentTextPart);
+            foundContent = true;
+          } else if (artifact.name === 'phase' && typeof data.phase === 'string') {
+            // Phase signal used to swap the streaming indicator label
+            // ("Agent is thinking..." → "Agent is summarizing...").
+            this.isSummarizing = data.phase === 'summarizing';
             foundContent = true;
           } else {
             // Generic data artifact
@@ -669,6 +685,7 @@ export const useChatStore = defineStore('chat', {
         tokenUsage,
         fileAttachments: fileAttachments && fileAttachments.length > 0 ? fileAttachments : undefined,
         reasoningModelLabel,
+        summary: msg.summary ?? undefined,
       };
     },
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, computed } from 'vue';
 import type { ChatMessage } from '../stores/chat';
+import { useChatStore } from '../stores/chat';
 import MessageBubble from './MessageBubble.vue';
 import ThinkingIndicator from './ThinkingIndicator.vue';
 import { Icon } from '@iconify/vue';
@@ -9,6 +10,8 @@ const props = defineProps<{
   messages: ChatMessage[];
   isStreaming?: boolean;
 }>();
+
+const chatStore = useChatStore();
 
 const scrollContainer = ref<HTMLElement | null>(null);
 
@@ -36,6 +39,11 @@ const streamingContentKey = computed(() => {
   const last = props.messages[props.messages.length - 1];
   return (last.content?.length || 0) + (last.thinkingSteps?.length || 0) * 100;
 });
+
+// Indicator label reflects whether the backend is currently summarizing
+const thinkingLabel = computed(() =>
+  chatStore.isSummarizing ? 'Agent is summarizing...' : 'Agent is thinking...'
+);
 
 watch(streamingContentKey, async () => {
   if (props.isStreaming) {
@@ -71,7 +79,7 @@ const scrollToBottom = () => {
       />
     </TransitionGroup>
 
-    <ThinkingIndicator v-if="isStreaming" />
+    <ThinkingIndicator v-if="isStreaming" :label="thinkingLabel" />
   </div>
 </template>
 

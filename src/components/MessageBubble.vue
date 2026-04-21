@@ -75,6 +75,11 @@ const parsedContent = computed(() => {
   return marked.parse(props.message.content) as string;
 });
 
+const parsedSummary = computed(() => {
+  if (!props.message.summary) return '';
+  return marked.parse(props.message.summary) as string;
+});
+
 // Format latency information for display
 const latencyDisplay = computed(() => {
   if (!props.message.latency || !props.message.latency.requestSentAt) return null;
@@ -222,6 +227,9 @@ const fileAttachments = computed<FileAttachment[]>(() => {
 
 // Collapse state for thinking process timeline
 const activeCollapse = ref<string[]>([]);
+
+// Collapse state for the reasoning summary (collapsed by default)
+const activeSummaryCollapse = ref<string[]>([]);
 
 // Track when the collapse was last expanded to prevent expand-then-immediately-collapse
 const lastExpandTime = ref<number>(0);
@@ -420,6 +428,21 @@ const handleThinkingClick = (event: MouseEvent) => {
           </el-collapse-item>
         </el-collapse>
         </div>
+
+      <!-- Reasoning summary (TL;DR of the ReAct trace; collapsible, below Thinking Process) -->
+      <div v-if="message.summary" class="reasoning-summary">
+        <el-collapse v-model="activeSummaryCollapse">
+          <el-collapse-item name="summary">
+            <template #title>
+              <span class="collapse-title">
+                <Icon icon="mdi:text-box-outline" class="collapse-icon" />
+                Summary
+              </span>
+            </template>
+            <div class="reasoning-summary-body marked-content" v-html="parsedSummary" v-link-blank></div>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
 
       <!-- File attachments carousel (bottom of bubble) -->
       <div v-if="fileAttachments.length" class="file-carousel-section">
@@ -838,6 +861,49 @@ const handleThinkingClick = (event: MouseEvent) => {
   color: var(--text-secondary);
   font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
   display: inline-block;
+}
+
+/* Reasoning Summary Section (collapsible; sits below Thinking Process) */
+.reasoning-summary {
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--primary-color, #4f8cff);
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.reasoning-summary :deep(.el-collapse) {
+  border: none;
+  background: transparent;
+}
+
+.reasoning-summary :deep(.el-collapse-item__header) {
+  background: transparent;
+  border: none;
+  height: auto;
+  line-height: 1.4;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.reasoning-summary :deep(.el-collapse-item__wrap) {
+  background: transparent;
+  border: none;
+}
+
+.reasoning-summary :deep(.el-collapse-item__content) {
+  padding: 10px 0 0 0;
+  color: var(--text-primary);
+}
+
+.reasoning-summary-body :deep(p:first-child) {
+  margin-top: 0;
+}
+
+.reasoning-summary-body :deep(p:last-child) {
+  margin-bottom: 0;
 }
 
 /* Thinking Process Section */

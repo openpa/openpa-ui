@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { Icon } from '@iconify/vue';
+
+withDefaults(defineProps<{ label?: string }>(), {
+  label: 'Agent is thinking...',
+});
 </script>
 
 <template>
   <div class="thinking-indicator">
     <Icon icon="mdi:loading" class="spinner-icon" />
-    <span class="text">Agent is thinking...</span>
+    <span class="text">{{ label }}</span>
   </div>
 </template>
 

@@ -33,6 +33,7 @@ export interface MessageRecord {
   thinking_steps: { thought: string; action: string; action_input: string; observation?: { kind: string; text?: string; data?: Record<string, any>; file?: any }[]; model_label?: string | null; reasoning_model_label?: string | null }[] | null;
   token_usage: { input_tokens: number; output_tokens: number } | null;
   metadata: Record<string, any> | null;
+  summary: string | null;
   created_at: number;
   ordering: number;
 }
