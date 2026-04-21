@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { ElForm, ElFormItem, ElSelect, ElOption, ElCard } from 'element-plus';
+import { ElForm, ElFormItem, ElSelect, ElOption } from 'element-plus';
 import { listLLMProviders, getProviderModels } from '../../services/configApi';
 import { useLLMModels } from '../../composables/useLLMModels';
 import ProviderConfigFields, { type ProviderWithState } from '../shared/ProviderConfigFields.vue';
@@ -23,7 +23,12 @@ const modelGroupHigh = ref(props.config['model_group.high'] || '');
 const modelGroupLow = ref(props.config['model_group.low'] || '');
 const reasoningEffortHigh = ref(props.config['model_group.high.reasoning_effort'] || '');
 const reasoningEffortLow = ref(props.config['model_group.low.reasoning_effort'] || '');
+const apiKeyProvider = ref('');
 const loading = ref(false);
+
+const selectedApiKeyProvider = computed(() =>
+  providers.value.find(p => p.name === apiKeyProvider.value) || null,
+);
 
 /** Extract provider name from a model group value like "groq/mixtral-8x7b". */
 function extractProvider(groupValue: string | undefined): string {
@@ -70,14 +75,33 @@ onMounted(async () => {
   loading.value = true;
   try {
     const res = await listLLMProviders(props.agentUrl, '');
-    providers.value = res.providers.map((p) => ({
-      ...p,
-      apiKey: props.config[`${p.name}.api_key`] || '',
-      configValues: Object.fromEntries(
-        Object.keys(p.config_fields || {}).map(k => [k, props.config[`${p.name}.${k}`] || ''])
-      ),
-      models: [],
-    }));
+    providers.value = res.providers.map((p) => {
+      // Determine active auth method
+      const authMethods = p.auth_methods || [];
+      let selectedMethod = p.active_auth_method || '';
+      if (!selectedMethod && authMethods.length > 0) {
+        const defaultMethod = authMethods.find(m => m.is_default);
+        selectedMethod = defaultMethod ? defaultMethod.id : authMethods[0].id;
+      }
+      // Check if config already has an auth_method for this provider
+      const savedMethod = props.config[`${p.name}.auth_method`];
+      if (savedMethod) selectedMethod = savedMethod;
+
+      return {
+        ...p,
+        apiKey: props.config[`${p.name}.api_key`] || '',
+        configValues: Object.fromEntries(
+          Object.keys(p.config_fields || {}).map(k => [k, props.config[`${p.name}.${k}`] || ''])
+        ),
+        models: [],
+        selectedAuthMethod: selectedMethod,
+        authFieldValues: Object.fromEntries(
+          authMethods.flatMap(am =>
+            Object.keys(am.fields).map(k => [k, props.config[`${p.name}.${k}`] || ''])
+          )
+        ),
+      } as ProviderWithState;
+    });
 
     for (const p of providers.value) {
       try {
@@ -105,7 +129,22 @@ function emitConfig() {
   if (reasoningEffortLow.value) config['model_group.low.reasoning_effort'] = reasoningEffortLow.value;
 
   for (const p of providers.value) {
+    // Emit auth_method selection
+    if (p.auth_methods && p.auth_methods.length > 0 && p.selectedAuthMethod) {
+      config[`${p.name}.auth_method`] = p.selectedAuthMethod;
+      // Emit field values for the selected auth method
+      const activeMethod = p.auth_methods.find(m => m.id === p.selectedAuthMethod);
+      if (activeMethod) {
+        for (const [key, value] of Object.entries(p.authFieldValues)) {
+          if (value && key in activeMethod.fields) {
+            config[`${p.name}.${key}`] = value;
+          }
+        }
+      }
+    }
+    // Legacy: emit api_key if set
     if (p.apiKey) config[`${p.name}.api_key`] = p.apiKey;
+    // Legacy: emit config_fields values
     for (const [key, value] of Object.entries(p.configValues)) {
       if (value) config[`${p.name}.${key}`] = value;
     }
@@ -128,19 +167,27 @@ watch(providers, emitConfig, { deep: true });
 
     <div v-if="loading" class="loading-state">Loading providers...</div>
 
-    <div v-else class="providers-grid">
-      <ElCard v-for="p in providers" :key="p.name" class="provider-card" shadow="hover">
-        <template #header>
-          <div class="provider-header">
-            <span class="provider-name">{{ p.display_name }}</span>
-          </div>
-        </template>
-        <ProviderConfigFields :provider="p" />
-      </ElCard>
-    </div>
+    <template v-else>
+      <div class="api-keys-section">
+        <h4 class="section-subtitle">API Keys</h4>
+        <p class="step-description">
+          Pick a provider to configure its credentials. You can switch providers and configure as many as you like — all entries are saved together when you finish setup.
+        </p>
+        <ElForm label-position="top" class="groups-form">
+          <ElFormItem label="Provider">
+            <ElSelect v-model="apiKeyProvider" placeholder="Select a provider to configure">
+              <ElOption v-for="p in providers" :key="p.name" :label="p.display_name" :value="p.name" />
+            </ElSelect>
+          </ElFormItem>
 
-    <div class="model-groups-section">
-      <h4 class="section-subtitle">Model Groups</h4>
+          <div v-if="selectedApiKeyProvider" class="provider-config-inline">
+            <ProviderConfigFields :provider="selectedApiKeyProvider" />
+          </div>
+        </ElForm>
+      </div>
+
+      <div class="model-groups-section">
+        <h4 class="section-subtitle">Model Groups</h4>
 
       <!-- High Group -->
       <div class="group-block">
@@ -193,7 +240,8 @@ watch(providers, emitConfig, { deep: true });
           </ElFormItem>
         </ElForm>
       </div>
-    </div>
+      </div>
+    </template>
   </div>
 </template>
 
@@ -210,16 +258,16 @@ watch(providers, emitConfig, { deep: true });
 
 .loading-state { text-align: center; padding: 40px; color: var(--text-secondary); }
 
-.providers-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 16px; margin-bottom: 28px;
+.api-keys-section { margin-bottom: 24px; }
+
+.provider-config-inline {
+  margin: 0 0 16px 0;
+  padding: 12px 16px;
+  border: 1px solid var(--border-color, #e4e7ed);
+  border-radius: 8px;
+  background: var(--surface-color, #fafafa);
+  max-width: 480px;
 }
-
-.provider-card { background: var(--surface-color); }
-
-.provider-header { display: flex; align-items: center; justify-content: space-between; }
-
-.provider-name { font-weight: 600; font-size: 0.95rem; }
 
 .model-groups-section { margin-top: 8px; }
 

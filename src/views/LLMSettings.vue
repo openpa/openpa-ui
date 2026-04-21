@@ -8,6 +8,7 @@ import {
   listLLMProviders,
   getProviderModels,
   updateProvider,
+  deleteProviderConfig,
   getModelGroups,
   updateModelGroups,
 } from '../services/configApi';
@@ -33,6 +34,26 @@ function extractProvider(groupValue: string): string {
   if (!groupValue) return '';
   const idx = groupValue.indexOf('/');
   return idx > 0 ? groupValue.substring(0, idx) : groupValue;
+}
+
+/** Build a ProviderWithState from an API LLMProvider response. */
+function buildProviderState(p: any): ProviderWithState {
+  // Determine the active auth method
+  const authMethods = p.auth_methods || [];
+  let selectedMethod = p.active_auth_method || '';
+  if (!selectedMethod && authMethods.length > 0) {
+    const defaultMethod = authMethods.find((m: any) => m.is_default);
+    selectedMethod = defaultMethod ? defaultMethod.id : authMethods[0].id;
+  }
+
+  return {
+    ...p,
+    apiKey: '',
+    configValues: { ...(p.current_values || {}) },
+    models: [],
+    selectedAuthMethod: selectedMethod,
+    authFieldValues: {},
+  };
 }
 
 const selectedApiKeyProvider = computed(() =>
@@ -80,12 +101,7 @@ onMounted(async () => {
       getModelGroups(settingsStore.agentUrl, settingsStore.authToken),
     ]);
 
-    providers.value = provRes.providers.map((p) => ({
-      ...p,
-      apiKey: '',
-      configValues: { ...(p.current_values || {}) },
-      models: [],
-    }));
+    providers.value = provRes.providers.map(buildProviderState);
 
     modelGroups.value = groupRes.model_groups;
 
@@ -109,6 +125,55 @@ onMounted(async () => {
   }
 });
 
+/** Save provider credentials using the new auth_methods flow. */
+async function saveProvider(provider: ProviderWithState) {
+  const config: Record<string, string> = {};
+
+  // If using auth_methods (new flow)
+  if (provider.auth_methods && provider.auth_methods.length > 0) {
+    config.auth_method = provider.selectedAuthMethod;
+    // Include field values for the selected auth method
+    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
+    if (activeMethod) {
+      for (const [key, value] of Object.entries(provider.authFieldValues)) {
+        if (value && key in activeMethod.fields) {
+          config[key] = value;
+        }
+      }
+    }
+  }
+
+  if (Object.keys(config).length <= 1 && !config.auth_method) return;
+  // Validate JSON fields
+  if (provider.auth_methods) {
+    const activeMethod = provider.auth_methods.find(m => m.id === provider.selectedAuthMethod);
+    if (activeMethod) {
+      for (const [key, value] of Object.entries(provider.authFieldValues)) {
+        if (value && activeMethod.fields[key]?.type === 'json') {
+          try {
+            JSON.parse(value);
+          } catch {
+            ElMessage.error(`Invalid JSON for ${activeMethod.fields[key].description || key}`);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  saving.value = true;
+  try {
+    await updateProvider(settingsStore.agentUrl, settingsStore.authToken, provider.name, config);
+    provider.configured = true;
+    ElMessage.success(`${provider.display_name} configuration saved`);
+  } catch (e) {
+    ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** Legacy: save API key only. */
 async function saveProviderKey(provider: ProviderWithState) {
   if (!provider.apiKey) return;
   saving.value = true;
@@ -125,6 +190,7 @@ async function saveProviderKey(provider: ProviderWithState) {
   }
 }
 
+/** Legacy: save config fields. */
 async function saveProviderConfig(provider: ProviderWithState) {
   const config: Record<string, string> = {};
   for (const [key, value] of Object.entries(provider.configValues)) {
@@ -155,6 +221,36 @@ async function saveProviderConfig(provider: ProviderWithState) {
     ElMessage.success(`${provider.display_name} configuration saved`);
   } catch (e) {
     ElMessage.error(`Failed to save: ${e instanceof Error ? e.message : 'Unknown error'}`);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function removeProviderConfiguration(provider: ProviderWithState) {
+  if (!confirm(`Remove all stored credentials for ${provider.display_name}?`)) return;
+  saving.value = true;
+  try {
+    await deleteProviderConfig(settingsStore.agentUrl, settingsStore.authToken, provider.name);
+    provider.configured = false;
+    provider.apiKey = '';
+    provider.authFieldValues = {};
+    provider.configValues = {};
+    // Reset configured status on auth method fields
+    if (provider.auth_methods) {
+      for (const am of provider.auth_methods) {
+        for (const field of Object.values(am.fields)) {
+          field.configured = false;
+        }
+      }
+    }
+    if (provider.config_fields) {
+      for (const field of Object.values(provider.config_fields)) {
+        (field as any).configured = false;
+      }
+    }
+    ElMessage.success(`${provider.display_name} configuration removed`);
+  } catch (e) {
+    ElMessage.error(`Failed to remove: ${e instanceof Error ? e.message : 'Unknown error'}`);
   } finally {
     saving.value = false;
   }
@@ -216,8 +312,10 @@ function goBack() {
                 :show-configured-badge="true"
                 :show-save-buttons="true"
                 :saving="saving"
+                @save-provider="saveProvider(selectedApiKeyProvider!)"
                 @save-key="saveProviderKey(selectedApiKeyProvider!)"
                 @save-config="saveProviderConfig(selectedApiKeyProvider!)"
+                @remove-config="removeProviderConfiguration(selectedApiKeyProvider!)"
               />
             </div>
           </ElForm>

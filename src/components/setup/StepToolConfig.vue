@@ -49,10 +49,11 @@ interface SetupToolItem {
   reasoningEffort: string;
   fullReasoning: boolean;
 
+  // Code-level defaults from TOOL_CONFIG.llm_parameters (placeholders only).
+  llmDefaults: NonNullable<ToolStatus['llm_defaults']>;
+
   enabled: boolean;
   expanded: boolean;
-  /** Built-in tools only: false until a child LLM is bound (post-setup). */
-  llmBound: boolean;
 }
 
 const items = ref<SetupToolItem[]>([]);
@@ -97,8 +98,15 @@ function initArgValues(
 }
 
 function getStatusTag(item: SetupToolItem) {
-  if (!item.isSkill && !item.llmBound) {
-    return { label: 'Setup required', type: 'warning' as const };
+  // Built-in tools report `llm_bound=false` until setup completes, so using it
+  // here would flag every tool as "Setup required" during the wizard. Instead,
+  // surface whether the tool still has unfilled required variables — that's
+  // the piece the user can act on from this screen.
+  const hasUnfilledRequired = Object.keys(item.configFields).some(
+    key => !item.configValues[key],
+  );
+  if (hasUnfilledRequired) {
+    return { label: 'Needs Config', type: 'warning' as const };
   }
   if (item.enabled) return { label: 'Enabled', type: 'success' as const };
   return { label: 'Disabled', type: 'info' as const };
@@ -160,16 +168,16 @@ onMounted(async () => {
         configValues: { ...initVarValues(tool.required_fields, tool.config?.variables), ...toolConf },
         argumentsSchema: schema,
         argValues: initArgValues(schema, tool.config?.arguments),
-        description: tool.description || metaCfg.description || '',
+        // User override only; code defaults are shown as placeholders via llmDefaults.
+        description: metaCfg.description || '',
         systemPrompt: (metaCfg.system_prompt as string) || '',
         llmProvider: (llmCfg.llm_provider as string) || '',
         llmModel: (llmCfg.llm_model as string) || '',
         reasoningEffort: (llmCfg.reasoning_effort as string) || '',
         fullReasoning: !!tool.full_reasoning,
+        llmDefaults: tool.llm_defaults ?? {},
         enabled: tool.enabled,
         expanded: false,
-        // Skills don't have a child LLM; treat them as bound.
-        llmBound: tool.tool_type === 'skill' ? true : (tool.llm_bound ?? true),
       };
     });
   } catch {
@@ -275,6 +283,12 @@ watch(items, emitConfigs, { deep: true });
                   :providers="llmProviders"
                   :get-filtered-models="getFilteredModels"
                   :get-reasoning-options="getReasoningOptions"
+                  :default-description="item.llmDefaults.description || item.llmDefaults.server_instructions || ''"
+                  :default-system-prompt="item.llmDefaults.system_prompt || ''"
+                  :default-llm-provider="item.llmDefaults.llm_provider || ''"
+                  :default-llm-model="item.llmDefaults.llm_model || ''"
+                  :default-reasoning-effort="item.llmDefaults.reasoning_effort || ''"
+                  :default-full-reasoning="item.llmDefaults.full_reasoning"
                 />
               </div>
 

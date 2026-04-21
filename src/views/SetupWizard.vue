@@ -252,8 +252,8 @@ async function copyToken() {
   width: 100%;
   height: 100vh;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: safe center;
+  justify-content: safe center;
   background: var(--bg-color);
   overflow-y: auto;
   padding: 24px;

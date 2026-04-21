@@ -11,10 +11,19 @@ import { useSettingsStore, type ProfileValue } from '../stores/settings';
 import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
   listTools, updateToolConfig, setToolEnabled, setToolFullReasoning,
-  updateToolArguments,
+  updateToolArguments, resetToolLLMKeys,
   listLLMProviders, getProviderModels,
-  type RemoteAgentInfo, type ToolStatus, type LLMProvider,
+  getSkillMode, setSkillMode,
+  type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
 } from '../services/configApi';
+
+type LLMDefaultField =
+  | 'description'
+  | 'system_prompt'
+  | 'llm_provider'
+  | 'llm_model'
+  | 'reasoning_effort'
+  | 'full_reasoning';
 import type { JsonSchema } from '../services/agentApi';
 import { getAuthUrl, unlinkAgent, reconnectAgent } from '../services/agentApi';
 import { useLLMModels } from '../composables/useLLMModels';
@@ -64,12 +73,17 @@ interface UnifiedItem {
   saving: boolean;
   /** Built-in tools only: false until a child LLM is bound (post-setup). */
   llmBound: boolean;
+  /** Code-level defaults from TOOL_CONFIG.llm_parameters (placeholders only).
+   *  Empty for skills / MCP / A2A — those don't ship code defaults. */
+  llmDefaults: NonNullable<ToolStatus['llm_defaults']>;
 }
 
 // ── Data ──
 const items = ref<UnifiedItem[]>([]);
 const llmProviders = ref<LLMProvider[]>([]);
 const loading = ref(false);
+const skillMode = ref<SkillMode>('manual');
+const skillModeSaving = ref(false);
 
 // Add agent dialog
 const showAddDialog = ref(false);
@@ -106,13 +120,16 @@ onMounted(async () => {
   window.addEventListener('message', handleAuthMessage);
   loading.value = true;
   try {
-    const [agentRes, toolRes, provRes] = await Promise.all([
+    const [agentRes, toolRes, provRes, skillModeRes] = await Promise.all([
       listAgents(settingsStore.agentUrl, props.profile),
       listTools(settingsStore.agentUrl, settingsStore.authToken),
       listLLMProviders(settingsStore.agentUrl, settingsStore.authToken),
+      getSkillMode(settingsStore.agentUrl, settingsStore.authToken, props.profile)
+        .catch(() => ({ mode: 'manual' as SkillMode })),
     ]);
 
     llmProviders.value = provRes.providers;
+    skillMode.value = skillModeRes.mode;
 
     // Load models for all providers using composable
     const providersWithModels: { name: string; display_name: string; models: any[] }[] = [];
@@ -181,6 +198,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
     const metaCfg = (tool.config?.meta ?? {}) as Record<string, string>;
     const schema = (tool.arguments_schema as JsonSchema | null) ?? null;
 
+    const llmDefaults = tool.llm_defaults ?? {};
     result.push({
       name: tool.tool_id,
       displayName: tool.name,
@@ -190,7 +208,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       toolConfigValues: initVarValues(tool.required_fields, tool.config?.variables),
       toolConfigured: tool.configured,
       agentName: tool.tool_id,
-      description: tool.description || metaCfg.description || '',
+      // User override only; code-level defaults are rendered as placeholders
+      // via `llmDefaults` on the form.
+      description: metaCfg.description || '',
       url: tool.url || '',
       systemPrompt: (metaCfg.system_prompt as string) || '',
       llmProvider: (llmCfg.llm_provider as string) || '',
@@ -211,6 +231,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       saving: false,
       // Skills don't have a child LLM; treat them as bound.
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
+      llmDefaults,
     });
   }
 
@@ -249,6 +270,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       expanded: false,
       saving: false,
       llmBound: true,
+      llmDefaults: {},
     });
   }
 
@@ -283,6 +305,7 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       expanded: false,
       saving: false,
       llmBound: true,
+      llmDefaults: {},
     });
   }
 
@@ -350,6 +373,26 @@ function resetLLMDefaults(item: UnifiedItem) {
   item.llmModel = '';
   item.reasoningEffort = '';
   item.fullReasoning = false;
+}
+
+/** Per-field "Reset to default" from LLMParametersForm.
+ *
+ *  Clears the DB override via DELETE /api/tools/{id}/llm and refreshes the
+ *  list so the placeholder/default re-appears. Only wired for built-in tools
+ *  today — MCP/A2A agents persist LLM overrides through a different endpoint. */
+async function handleResetField(item: UnifiedItem, field: LLMDefaultField) {
+  if (!item.toolName || item.kind !== 'builtin') return;
+  try {
+    await resetToolLLMKeys(
+      settingsStore.agentUrl,
+      settingsStore.authToken,
+      item.toolName,
+      [field],
+    );
+    await reloadAll();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to reset field');
+  }
 }
 
 async function toggleItemEnabled(item: UnifiedItem, value: boolean) {
@@ -479,6 +522,22 @@ async function reloadAll() {
 }
 
 function goBack() { router.push(`/${props.profile}/settings`); }
+
+async function onSkillModeChange(value: string | number | boolean | undefined) {
+  const next = value as SkillMode;
+  const previous: SkillMode = next === 'manual' ? 'automatic' : 'manual';
+  skillMode.value = next;
+  skillModeSaving.value = true;
+  try {
+    await setSkillMode(settingsStore.agentUrl, settingsStore.authToken, props.profile, next);
+    ElMessage.success(`Skill mode set to ${next}`);
+  } catch (e) {
+    skillMode.value = previous;
+    ElMessage.error(e instanceof Error ? e.message : 'Failed to update skill mode');
+  } finally {
+    skillModeSaving.value = false;
+  }
+}
 </script>
 
 <template>
@@ -536,6 +595,13 @@ function goBack() { router.push(`/${props.profile}/settings`); }
                     :providers="llmProviders"
                     :get-filtered-models="getFilteredModels"
                     :get-reasoning-options="getReasoningOptions"
+                    :default-description="item.llmDefaults.description || item.llmDefaults.server_instructions || ''"
+                    :default-system-prompt="item.llmDefaults.system_prompt || ''"
+                    :default-llm-provider="item.llmDefaults.llm_provider || ''"
+                    :default-llm-model="item.llmDefaults.llm_model || ''"
+                    :default-reasoning-effort="item.llmDefaults.reasoning_effort || ''"
+                    :default-full-reasoning="item.llmDefaults.full_reasoning"
+                    @reset-field="handleResetField(item, $event)"
                   />
                 </div>
 
@@ -563,6 +629,24 @@ function goBack() { router.push(`/${props.profile}/settings`); }
           <h2 class="section-title">
             <Icon icon="mdi:creation" class="section-icon" /> Skills
           </h2>
+
+          <div class="skill-mode-row">
+            <span class="skill-mode-label">Skill Mode</span>
+            <ElRadioGroup
+              v-model="skillMode"
+              size="small"
+              :disabled="skillModeSaving"
+              @change="onSkillModeChange"
+            >
+              <ElRadioButton value="manual">Manual</ElRadioButton>
+              <ElRadioButton value="automatic">Automatic</ElRadioButton>
+            </ElRadioGroup>
+            <span class="skill-mode-hint">
+              {{ skillMode === 'manual'
+                  ? 'All enabled skills are exposed to the agent.'
+                  : 'Top 10 skills matching your message are selected via vector search.' }}
+            </span>
+          </div>
 
           <div class="items-list">
             <ElCard v-for="item in skillItems" :key="item.name" class="item-card" shadow="hover">
@@ -846,6 +930,28 @@ function goBack() { router.push(`/${props.profile}/settings`); }
 .empty-args { color: var(--text-tertiary); font-size: 0.8rem; padding: 4px 0 12px 0; }
 .empty-state { color: var(--text-tertiary); font-size: 0.85rem; padding: 16px 0; }
 .add-btn { margin-top: 8px; }
+
+.skill-mode-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color, #e4e7ed);
+  border-radius: 6px;
+}
+.skill-mode-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.skill-mode-hint {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  flex: 1 1 auto;
+}
 
 .json-config-input :deep(textarea) { font-family: monospace; font-size: 0.8rem; }
 .json-config-hint {

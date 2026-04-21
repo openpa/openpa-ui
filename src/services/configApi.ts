@@ -120,6 +120,25 @@ export interface ProviderConfigField {
   configured: boolean;
 }
 
+export interface AuthMethodField {
+  description: string;
+  type: string;
+  secret: boolean;
+  required: boolean;
+  default?: string;
+  configured: boolean;
+}
+
+export interface AuthMethod {
+  id: string;
+  label: string;
+  hint?: string;
+  instructions?: string;
+  kind: string; // "api_key" | "token" | "oauth" | "service_account" | "none"
+  is_default?: boolean;
+  fields: Record<string, AuthMethodField>;
+}
+
 export interface LLMProvider {
   name: string;
   display_name: string;
@@ -129,6 +148,8 @@ export interface LLMProvider {
   model_count: number;
   config_fields?: Record<string, ProviderConfigField>;
   current_values?: Record<string, string>;
+  auth_methods?: AuthMethod[];
+  active_auth_method?: string;
 }
 
 export interface LLMModel {
@@ -178,6 +199,58 @@ export async function updateProvider(
     body: JSON.stringify(config),
   });
   if (!res.ok) throw new Error(`Failed to update provider: ${res.statusText}`);
+  return res.json();
+}
+
+export async function deleteProviderConfig(
+  agentUrl: string,
+  token: string,
+  providerName: string
+): Promise<{ success: boolean; deleted_keys: number }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/providers/${encodeURIComponent(providerName)}/config`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to remove provider config: ${res.statusText}`);
+  return res.json();
+}
+
+// ── Device Code Flow (GitHub Copilot) ──
+
+export interface DeviceCodeResponse {
+  verification_uri: string;
+  user_code: string;
+  device_code: string;
+  expires_in: number;
+  interval: number;
+}
+
+export async function startDeviceCodeFlow(
+  agentUrl: string,
+  token: string
+): Promise<DeviceCodeResponse> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/auth/device-code/start`, {
+    method: 'POST',
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to start device code flow: ${res.statusText}`);
+  return res.json();
+}
+
+export async function pollDeviceCode(
+  agentUrl: string,
+  token: string,
+  deviceCode: string
+): Promise<{ status: 'pending' | 'complete' | 'expired' | 'error'; slow_down?: boolean; error?: string; access_token?: string }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/llm/auth/device-code/poll`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+  if (!res.ok) throw new Error(`Failed to poll device code: ${res.statusText}`);
   return res.json();
 }
 
@@ -248,6 +321,18 @@ export interface ToolStatus {
   /** Mirrored from config.llm.full_reasoning for convenience. */
   full_reasoning: boolean;
   arguments_schema: Record<string, unknown> | null;
+  /** Code-level defaults shipped with the tool (from TOOL_CONFIG.llm_parameters).
+   *  Surfaced here so the UI can render them as placeholders without writing
+   *  them into the database until the user actually overrides a value. */
+  llm_defaults?: {
+    server_instructions?: string;
+    description?: string;
+    system_prompt?: string;
+    llm_provider?: string;
+    llm_model?: string;
+    reasoning_effort?: string;
+    full_reasoning?: boolean;
+  };
   /** Optional fields surfaced by the registry: */
   url?: string;
   owner_profile?: string | null;
@@ -314,6 +399,28 @@ export async function setToolEnabled(
     body: JSON.stringify({ enabled }),
   });
   if (!res.ok) throw new Error(`Failed to set tool enabled: ${res.statusText}`);
+  return res.json();
+}
+
+/** Reset selected LLM-parameter overrides so the tool's code defaults apply.
+ *
+ *  Keys in {system_prompt, description} are removed from the `meta` scope;
+ *  all others are removed from the `llm` scope. The adapter's child LLM is
+ *  rebuilt server-side when a provider-shaping key is reset.
+ */
+export async function resetToolLLMKeys(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  keys: string[]
+): Promise<{ success: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/tools/${encodeURIComponent(toolId)}/llm`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+    body: JSON.stringify({ keys }),
+  });
+  if (!res.ok) throw new Error(`Failed to reset LLM keys: ${res.statusText}`);
   return res.json();
 }
 
@@ -406,6 +513,40 @@ export async function updatePersona(
     body: JSON.stringify({ content }),
   });
   if (!res.ok) throw new Error(`Failed to update persona: ${res.statusText}`);
+  return res.json();
+}
+
+export type SkillMode = 'manual' | 'automatic';
+
+export async function getSkillMode(
+  agentUrl: string,
+  token: string,
+  profileName: string
+): Promise<{ mode: SkillMode }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/skill-mode`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to load skill mode: ${res.statusText}`);
+  return res.json();
+}
+
+export async function setSkillMode(
+  agentUrl: string,
+  token: string,
+  profileName: string,
+  mode: SkillMode
+): Promise<{ success: boolean; mode: SkillMode }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/profiles/${encodeURIComponent(profileName)}/skill-mode`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to update skill mode: ${res.statusText}`);
+  }
   return res.json();
 }
 
