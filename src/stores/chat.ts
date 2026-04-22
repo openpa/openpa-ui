@@ -453,9 +453,11 @@ export const useChatStore = defineStore('chat', {
           } else if (artifact.name === 'phase' && typeof data.phase === 'string') {
             // Phase signal used to swap the streaming indicator label
             // ("Agent is thinking..." → "Agent is summarizing...").
+            console.log('[indicator] phase artifact received:', data.phase);
             this.isSummarizing = data.phase === 'summarizing';
             foundContent = true;
           } else {
+            console.log('[indicator] generic data artifact:', { name: artifact.name, data });
             // Generic data artifact
             const artifactInfo: ArtifactInfo = {
               name: artifact.name || 'unknown',

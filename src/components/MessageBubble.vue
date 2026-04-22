@@ -865,8 +865,8 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 /* Reasoning Summary Section (collapsible; sits below Thinking Process) */
 .reasoning-summary {
-  margin-top: 12px;
-  padding: 14px;
+  margin-top: 10px;
+  padding: 4px 12px;
   background: var(--surface-hover);
   border: 1px solid var(--border-color);
   border-left: 3px solid var(--primary-color, #4f8cff);
@@ -882,8 +882,9 @@ const handleThinkingClick = (event: MouseEvent) => {
 .reasoning-summary :deep(.el-collapse-item__header) {
   background: transparent;
   border: none;
-  height: auto;
-  line-height: 1.4;
+  height: 28px;
+  line-height: 28px;
+  min-height: 28px;
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -908,8 +909,8 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 /* Thinking Process Section */
 .thinking-section {
-  margin-top: 12px;
-  padding: 14px;
+  margin-top: 10px;
+  padding: 4px 12px;
   background: var(--surface-hover);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -941,8 +942,9 @@ const handleThinkingClick = (event: MouseEvent) => {
   background: transparent;
   border: none;
   font-size: 0.875rem;
-  height: 36px;
-  line-height: 36px;
+  height: 28px;
+  line-height: 28px;
+  min-height: 28px;
   font-weight: 500;
 }
 
@@ -981,6 +983,9 @@ const handleThinkingClick = (event: MouseEvent) => {
 
 .reasoning-model {
   margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 0.72em;
+  line-height: 2.2;
 }
 
 .step-model {

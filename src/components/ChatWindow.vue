@@ -41,9 +41,15 @@ const streamingContentKey = computed(() => {
 });
 
 // Indicator label reflects whether the backend is currently summarizing
-const thinkingLabel = computed(() =>
-  chatStore.isSummarizing ? 'Agent is summarizing...' : 'Agent is thinking...'
-);
+const thinkingLabel = computed(() => {
+  const val = chatStore.isSummarizing ? 'Agent is summarizing...' : 'Agent is thinking...';
+  console.log('[indicator] thinkingLabel computed ->', val, 'isSummarizing=', chatStore.isSummarizing);
+  return val;
+});
+
+watch(() => chatStore.isSummarizing, (v) => {
+  console.log('[indicator] isSummarizing changed ->', v);
+});
 
 watch(streamingContentKey, async () => {
   if (props.isStreaming) {
