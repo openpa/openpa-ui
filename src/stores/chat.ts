@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { getA2AClient } from '../services/a2aClient';
+import { getA2AClient, getApiOrigin } from '../services/a2aClient';
 import { useSettingsStore } from './settings';
 import {
   fetchConversations as apiFetchConversations,
@@ -291,6 +291,39 @@ export const useChatStore = defineStore('chat', {
       } finally {
         this.isStreaming = false;
         this.isSummarizing = false;
+      }
+    },
+
+    /**
+     * Stop the in-flight conversation. Tells the backend to cancel the
+     * running task; flips the UI optimistically so the button morphs back
+     * instantly. The streaming for-await loop in sendMessage() will exit
+     * naturally as the backend closes the stream.
+     */
+    async stopMessage() {
+      const taskId = this.currentTaskId;
+      // Optimistic UI flip — even if the network call fails, the user sees
+      // the button revert immediately.
+      this.isStreaming = false;
+      this.isSummarizing = false;
+      const last = this.messages[this.messages.length - 1];
+      if (last?.role === 'assistant') {
+        last.isStreaming = false;
+      }
+
+      if (!taskId) {
+        // Stop pressed before the first stream event registered a task id.
+        return;
+      }
+
+      try {
+        const token = useSettingsStore().authToken;
+        await fetch(`${getApiOrigin()}/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+          method: 'POST',
+          headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+        });
+      } catch (e) {
+        console.warn('Cancel request failed', e);
       }
     },
 

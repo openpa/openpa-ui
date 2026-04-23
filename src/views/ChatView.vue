@@ -107,9 +107,11 @@ const handleSendMessage = async (text: string) => {
     <!-- Message input -->
     <MessageInput
       :disabled="!chatStore.isConnected || chatStore.isStreaming"
+      :isProcessing="chatStore.isStreaming"
       :reasoningEnabled="settingsStore.reasoningEnabled"
       @update:reasoningEnabled="settingsStore.setReasoningEnabled(settingsStore.profileId, $event)"
       @send="handleSendMessage"
+      @stop="chatStore.stopMessage()"
     />
   </div>
 </template>

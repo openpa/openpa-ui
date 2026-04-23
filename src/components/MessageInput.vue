@@ -5,6 +5,7 @@ import { Icon } from '@iconify/vue';
 
 const props = withDefaults(defineProps<{
   disabled?: boolean;
+  isProcessing?: boolean;
   reasoningEnabled?: boolean;
 }>(), {
   reasoningEnabled: true,
@@ -12,13 +13,18 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   send: [text: string];
+  stop: [];
   'update:reasoningEnabled': [enabled: boolean];
 }>();
 
 const inputText = ref('');
 const popoverVisible = ref(false);
 
-const handleSend = () => {
+const handleClick = () => {
+  if (props.isProcessing) {
+    emit('stop');
+    return;
+  }
   if (inputText.value.trim() && !props.disabled) {
     emit('send', inputText.value.trim());
     inputText.value = '';
@@ -26,10 +32,11 @@ const handleSend = () => {
 };
 
 const handleKeydown = (event: Event | KeyboardEvent) => {
-  // Enter to send, Shift+Enter for newline
+  // Enter to send (no-op while processing so it can't accidentally stop),
+  // Shift+Enter for newline.
   if (event instanceof KeyboardEvent && event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    handleSend();
+    if (!props.isProcessing) handleClick();
   }
 };
 
@@ -78,12 +85,16 @@ const handleReasoningToggle = (value: boolean | string | number) => {
         </div>
       </ElPopover>
       <button
-        @click="handleSend"
-        :disabled="disabled || !inputText.trim()"
+        @click="handleClick"
+        :disabled="!isProcessing && (disabled || !inputText.trim())"
         class="send-button"
-        :class="{ 'disabled': disabled || !inputText.trim() }"
+        :class="{
+          'disabled': !isProcessing && (disabled || !inputText.trim()),
+          'stop': isProcessing,
+        }"
+        :title="isProcessing ? 'Stop' : 'Send'"
       >
-        <Icon icon="mdi:send" />
+        <Icon :icon="isProcessing ? 'mdi:stop' : 'mdi:send'" />
       </button>
     </div>
   </div>
@@ -205,5 +216,15 @@ const handleReasoningToggle = (value: boolean | string | number) => {
   background: var(--text-tertiary);
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+.send-button.stop {
+  background: #ef4444;
+  cursor: pointer;
+  opacity: 1;
+}
+
+.send-button.stop:hover {
+  background: #dc2626;
 }
 </style>

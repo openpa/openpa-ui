@@ -65,6 +65,14 @@ function extractOrigin(url: string): string {
 }
 
 /**
+ * Resolves the agent server's origin for plain REST calls
+ * (e.g. /api/tasks/{id}/cancel) outside the A2A SDK transport.
+ */
+export function getApiOrigin(): string {
+  return extractOrigin(getBaseUrl());
+}
+
+/**
  * Creates an AuthenticationHandler that reads the active JWT token
  * from the settings store and injects it as a Bearer token.
  */
