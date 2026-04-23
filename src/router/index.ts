@@ -64,6 +64,19 @@ const routes = [
     component: () => import('../views/ProfileSettings.vue'),
     props: true,
   },
+  // Process Manager — long-running exec_shell processes
+  {
+    path: '/:profile/processes',
+    name: 'process-list',
+    component: () => import('../views/ProcessList.vue'),
+    props: true,
+  },
+  {
+    path: '/:profile/processes/:pid',
+    name: 'process-terminal',
+    component: () => import('../views/ProcessTerminal.vue'),
+    props: true,
+  },
 ];
 
 const router = createRouter({

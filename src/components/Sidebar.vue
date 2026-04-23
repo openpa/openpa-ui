@@ -32,6 +32,12 @@ const handleOpenSettings = () => {
   emit('openSettings');
 };
 
+const handleOpenProcessManager = () => {
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'process-list', params: { profile } });
+};
+
 const handleLogout = () => {
   emit('logout');
 };
@@ -140,6 +146,11 @@ const sortedConversations = computed(() => {
       <div class="settings-row logout-row" @click="handleLogout">
         <Icon icon="mdi:logout" class="settings-icon" />
         <span class="settings-label">Logout</span>
+        <Icon icon="mdi:chevron-right" class="chevron-icon" />
+      </div>
+      <div class="settings-row" @click="handleOpenProcessManager">
+        <Icon icon="mdi:console" class="settings-icon" />
+        <span class="settings-label">Process Manager</span>
         <Icon icon="mdi:chevron-right" class="chevron-icon" />
       </div>
       <div class="theme-row">

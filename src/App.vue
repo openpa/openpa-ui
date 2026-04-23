@@ -30,7 +30,7 @@ const showSidebar = computed(() => {
 });
 
 // Routes that are profile-scoped and require auth
-const PROFILE_ROUTES = new Set(['chat', 'conversation', 'settings', 'llm-settings', 'tools-skills-settings', 'profile-settings']);
+const PROFILE_ROUTES = new Set(['chat', 'conversation', 'settings', 'llm-settings', 'tools-skills-settings', 'profile-settings', 'process-list', 'process-terminal']);
 
 // Apply theme to document
 const applyTheme = () => {
