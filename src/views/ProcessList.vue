@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { ElTable, ElTableColumn, ElButton, ElTag, ElAlert, ElMessageBox } from 'element-plus';
+import { ElTable, ElTableColumn, ElButton, ElTag, ElAlert, ElMessage, ElMessageBox, ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
 import { useProcessManagerStore } from '../stores/processManager';
 import { useSettingsStore } from '../stores/settings';
-import { stopProcess, type ProcessRow } from '../services/processApi';
+import {
+  DuplicateAutostartError,
+  registerAutostart,
+  runAutostart,
+  stopProcess,
+  unregisterAutostart,
+  type ProcessRow,
+} from '../services/processApi';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -106,7 +113,74 @@ type TagType = 'success' | 'info' | 'warning' | 'danger' | 'primary';
 function statusColor(status: string): TagType {
   if (status === 'running') return 'success';
   if (status === 'exited') return 'info';
+  if (status === 'failed_to_autostart') return 'warning';
   return 'primary';
+}
+
+async function doRegister(row: ProcessRow, force: boolean) {
+  const created = await registerAutostart(
+    settings.agentUrl, settings.authToken, row.process_id, force,
+  );
+  row.autostart_id = created.id;
+  ElMessage.success('Registered to start with OpenPA');
+  await store.refresh();
+}
+
+async function toggleAutostart(row: ProcessRow) {
+  if (row.autostart_id) {
+    try {
+      await ElMessageBox.confirm(
+        `Unregister "Start with OpenPA" for this process?\n\n${row.command}`,
+        'Unregister autostart',
+        { confirmButtonText: 'Unregister', cancelButtonText: 'Cancel', type: 'warning' },
+      );
+    } catch {
+      return;
+    }
+    try {
+      await unregisterAutostart(settings.agentUrl, settings.authToken, row.autostart_id);
+      row.autostart_id = null;
+      ElMessage.success('Autostart removed');
+      await store.refresh();
+    } catch (err) {
+      ElMessage.error(err instanceof Error ? err.message : String(err));
+    }
+    return;
+  }
+
+  try {
+    await doRegister(row, false);
+  } catch (err) {
+    if (err instanceof DuplicateAutostartError) {
+      try {
+        await ElMessageBox.confirm(
+          `A command already registered to start with OpenPA matches this one:\n\n${err.existing.command}\n\nRegister this one anyway?`,
+          'Duplicate command',
+          { confirmButtonText: 'Register anyway', cancelButtonText: 'Cancel', type: 'warning' },
+        );
+      } catch {
+        return;
+      }
+      try {
+        await doRegister(row, true);
+      } catch (err2) {
+        ElMessage.error(err2 instanceof Error ? err2.message : String(err2));
+      }
+      return;
+    }
+    ElMessage.error(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function manualRun(row: ProcessRow) {
+  if (!row.autostart_id) return;
+  try {
+    await runAutostart(settings.agentUrl, settings.authToken, row.autostart_id);
+    ElMessage.success('Process started');
+    await store.refresh();
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err));
+  }
 }
 </script>
 
@@ -150,12 +224,19 @@ function statusColor(status: string): TagType {
         class="process-table"
         stripe
       >
-        <ElTableColumn label="Status" width="110">
+        <ElTableColumn label="Status" width="160">
           <template #default="{ row }">
             <ElTag :type="statusColor(row.status)" size="small" effect="light">
               {{ row.status }}{{ row.exit_code !== null && row.exit_code !== undefined ? ` (${row.exit_code})` : '' }}
             </ElTag>
             <span v-if="row.is_pty" class="pty-pill">pty</span>
+            <ElTooltip
+              v-if="row.status === 'failed_to_autostart' && row.last_error"
+              :content="row.last_error"
+              placement="top"
+            >
+              <Icon icon="mdi:alert" class="warn-icon" />
+            </ElTooltip>
           </template>
         </ElTableColumn>
         <ElTableColumn label="Process ID" width="120" prop="process_id" />
@@ -175,14 +256,32 @@ function statusColor(status: string): TagType {
         <ElTableColumn label="Expires in" width="110">
           <template #default="{ row }">{{ formatRelativeExpiry(row.expire_at) }}</template>
         </ElTableColumn>
-        <ElTableColumn label="Actions" width="220" align="right">
+        <ElTableColumn label="Actions" width="320" align="right">
           <template #default="{ row }">
-            <ElButton size="small" type="primary" @click="openTerminal(row.process_id)">
-              <Icon icon="mdi:console" /> &nbsp;Terminal
-            </ElButton>
-            <ElButton size="small" @click="confirmStop(row)">
-              <Icon icon="mdi:stop" /> &nbsp;Stop
-            </ElButton>
+            <template v-if="row.status === 'failed_to_autostart'">
+              <ElButton size="small" type="warning" @click="manualRun(row)">
+                <Icon icon="mdi:play" /> &nbsp;Run
+              </ElButton>
+              <ElButton size="small" @click="toggleAutostart(row)">
+                <Icon icon="mdi:star" /> &nbsp;Unregister
+              </ElButton>
+            </template>
+            <template v-else>
+              <ElTooltip
+                :content="row.autostart_id ? 'Unregister from OpenPA autostart' : 'Start with OpenPA'"
+                placement="top"
+              >
+                <ElButton size="small" :type="row.autostart_id ? 'warning' : 'default'" @click="toggleAutostart(row)">
+                  <Icon :icon="row.autostart_id ? 'mdi:star' : 'mdi:star-outline'" />
+                </ElButton>
+              </ElTooltip>
+              <ElButton size="small" type="primary" @click="openTerminal(row.process_id)">
+                <Icon icon="mdi:console" /> &nbsp;Terminal
+              </ElButton>
+              <ElButton size="small" @click="confirmStop(row)">
+                <Icon icon="mdi:stop" /> &nbsp;Stop
+              </ElButton>
+            </template>
           </template>
         </ElTableColumn>
       </ElTable>
@@ -271,6 +370,12 @@ function statusColor(status: string): TagType {
   border-radius: 4px;
   font-size: 0.7rem;
   padding: 0 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.warn-icon {
+  color: var(--warning-color, #f59e0b);
+  font-size: 1rem;
   margin-left: 6px;
   vertical-align: middle;
 }

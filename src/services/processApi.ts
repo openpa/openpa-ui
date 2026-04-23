@@ -30,7 +30,7 @@ function authHeaders(token: string): Record<string, string> {
   return headers;
 }
 
-export type ProcessStatus = 'running' | 'exited';
+export type ProcessStatus = 'running' | 'exited' | 'failed_to_autostart';
 
 export interface ProcessRow {
   process_id: string;
@@ -44,6 +44,21 @@ export interface ProcessRow {
   /** Unix seconds (wall clock) when the registry entry will expire. */
   expire_at: number;
   is_pty: boolean;
+  /** Autostart registration id; null when the process is not registered. */
+  autostart_id: string | null;
+  /** Last autostart error; only populated on ``failed_to_autostart`` rows. */
+  last_error: string | null;
+}
+
+export interface AutostartRow {
+  id: string;
+  profile: string;
+  command: string;
+  working_dir: string;
+  is_pty: boolean;
+  created_at: number;
+  last_error: string | null;
+  last_attempted_at: number | null;
 }
 
 export async function listProcesses(
@@ -117,6 +132,86 @@ export async function resizeProcess(
     body: JSON.stringify({ cols, rows }),
   });
   return res.json();
+}
+
+export async function listAutostart(
+  agentUrl: string,
+  token: string,
+): Promise<{ autostart: AutostartRow[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/autostart-processes`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to list autostart: ${res.statusText}`);
+  return res.json();
+}
+
+export class DuplicateAutostartError extends Error {
+  existing: AutostartRow;
+  constructor(existing: AutostartRow, message: string) {
+    super(message);
+    this.name = 'DuplicateAutostartError';
+    this.existing = existing;
+  }
+}
+
+export async function registerAutostart(
+  agentUrl: string,
+  token: string,
+  processId: string,
+  force = false,
+): Promise<AutostartRow> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/autostart-processes`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ process_id: processId, force }),
+  });
+  if (res.status === 409) {
+    const data = await res.json().catch(() => ({}));
+    throw new DuplicateAutostartError(
+      data.existing,
+      data.message || 'A registration with the same command already exists.',
+    );
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || data.error || `Failed to register: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function unregisterAutostart(
+  agentUrl: string,
+  token: string,
+  autostartId: string,
+): Promise<void> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/autostart-processes/${encodeURIComponent(autostartId)}`,
+    { method: 'DELETE', headers: authHeaders(token) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to unregister: ${res.statusText}`);
+  }
+}
+
+export async function runAutostart(
+  agentUrl: string,
+  token: string,
+  autostartId: string,
+): Promise<{ process_id: string }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/autostart-processes/${encodeURIComponent(autostartId)}/run`,
+    { method: 'POST', headers: authHeaders(token) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.message || data.error || `Failed to run: ${res.statusText}`);
+  }
+  return data;
 }
 
 /**
