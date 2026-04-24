@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
 import type { AgentCard } from '@a2a-js/sdk';
-import { ElButton } from 'element-plus';
+import { ElButton, ElTooltip } from 'element-plus';
 import { Icon } from '@iconify/vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   agentCard: AgentCard | null;
   isConnected: boolean;
-}>();
+  compact?: boolean;
+}>(), {
+  compact: false,
+});
 
 const emit = defineEmits<{
   connect: [];
@@ -29,30 +32,49 @@ const handleConnectionToggle = () => {
 };
 
 const toggleExpand = () => {
+  if (props.compact) return;
   isExpanded.value = !isExpanded.value;
 };
 </script>
 
 <template>
-  <div class="agent-card" :class="{ 'disconnected': !isConnected, 'expanded': isExpanded }">
+  <div class="agent-card" :class="{ 'disconnected': !isConnected, 'expanded': isExpanded, 'compact': compact }">
     <!-- Compact Header (Always Visible) -->
-    <div class="agent-header" @click="toggleExpand">
-      <div class="agent-avatar">
-        <Icon icon="tabler:alien" />
-      </div>
-      <div class="agent-brief">
-        <h3 class="agent-name">{{ agentCard?.name || 'Agent' }}</h3>
-        <div class="agent-status-row">
-          <span class="status-dot" :class="{ 'connected': isConnected }"></span>
-          <span class="status-text">{{ isConnected ? 'Connected' : 'Disconnected' }}</span>
+    <ElTooltip
+      :content="`${agentCard?.name || 'Agent'} — ${isConnected ? 'Connected' : 'Disconnected'}`"
+      placement="right"
+      :show-after="300"
+      :disabled="!compact"
+    >
+      <div class="agent-header" @click="toggleExpand">
+        <div class="agent-header-top">
+          <div class="agent-avatar">
+            <Icon icon="tabler:alien" />
+            <span v-if="compact" class="avatar-status-dot" :class="{ 'connected': isConnected }"></span>
+          </div>
+          <div class="agent-brief" v-if="!compact">
+            <h3 class="agent-name">{{ agentCard?.name || 'Agent' }}</h3>
+            <div class="agent-status-row">
+              <span class="status-dot" :class="{ 'connected': isConnected }"></span>
+              <span class="status-text">{{ isConnected ? 'Connected' : 'Disconnected' }}</span>
+            </div>
+          </div>
+          <div v-if="!compact && $slots['header-action']" class="agent-header-action" @click.stop>
+            <slot name="header-action" />
+          </div>
+        </div>
+        <div v-if="!compact" class="agent-header-bottom">
+          <Icon icon="mdi:chevron-down" class="expand-icon" />
+        </div>
+        <div v-else-if="$slots['header-action']" class="agent-header-bottom" @click.stop>
+          <slot name="header-action" />
         </div>
       </div>
-      <Icon icon="mdi:chevron-down" class="expand-icon" />
-    </div>
+    </ElTooltip>
 
     <!-- Expanded Details (Shown when expanded) -->
     <transition name="expand">
-      <div v-if="isExpanded" class="agent-details">
+      <div v-if="isExpanded && !compact" class="agent-details">
         <p v-if="agentCard?.description" class="agent-description">{{ agentCard.description }}</p>
 
         <div class="agent-meta">
@@ -94,8 +116,8 @@ const toggleExpand = () => {
 
 .agent-header {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  gap: 4px;
   padding: 12px 16px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -103,6 +125,24 @@ const toggleExpand = () => {
 
 .agent-header:hover {
   background: var(--hover-bg);
+}
+
+.agent-header-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.agent-header-action {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.agent-header-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .agent-avatar {
@@ -116,6 +156,37 @@ const toggleExpand = () => {
   justify-content: center;
   font-size: 16px;
   flex-shrink: 0;
+  position: relative;
+}
+
+.avatar-status-dot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger-color);
+  border: 2px solid var(--surface-color);
+}
+
+.avatar-status-dot.connected {
+  background: var(--success-color);
+}
+
+.agent-card.compact .agent-header {
+  align-items: center;
+  padding: 12px 0;
+  cursor: default;
+  gap: 8px;
+}
+
+.agent-card.compact .agent-header-top {
+  justify-content: center;
+}
+
+.agent-card.compact .agent-header:hover {
+  background: transparent;
 }
 
 .agent-brief {

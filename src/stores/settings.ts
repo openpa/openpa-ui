@@ -52,6 +52,9 @@ export const useSettingsStore = defineStore('settings', () => {
     (localStorage.getItem('theme') as 'light' | 'dark') || 'light'
   );
 
+  // Sidebar collapsed state
+  const sidebarCollapsed = ref(localStorage.getItem('sidebar_collapsed') === 'true');
+
   // Active profile ID (the currently-used profile for this tab session)
   const profileId = ref(localStorage.getItem('profile_id') || '');
 
@@ -153,6 +156,11 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem('theme', newTheme);
   }
 
+  function setSidebarCollapsed(value: boolean) {
+    sidebarCollapsed.value = value;
+    localStorage.setItem('sidebar_collapsed', String(value));
+  }
+
   function setProfileId(id: string) {
     profileId.value = id;
   }
@@ -199,6 +207,7 @@ export const useSettingsStore = defineStore('settings', () => {
     autoConnect,
     agentUrl,
     theme,
+    sidebarCollapsed,
     profileId,
     authToken,
     workingDir,
@@ -206,6 +215,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setAutoConnect,
     setAgentUrl,
     setTheme,
+    setSidebarCollapsed,
     setProfileId,
     setAuthToken,
     exportSettings,

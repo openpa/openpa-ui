@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
-import { ElSwitch } from 'element-plus';
+import { ElSwitch, ElTooltip } from 'element-plus';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
 import AgentCard from './AgentCard.vue';
@@ -76,23 +76,46 @@ const handleClearAllConversations = async () => {
 const sortedConversations = computed(() => {
   return [...chatStore.conversations].sort((a, b) => b.createdAt - a.createdAt);
 });
+
+const isCollapsed = computed(() => settingsStore.sidebarCollapsed);
+
+const toggleCollapsed = () => {
+  settingsStore.setSidebarCollapsed(!isCollapsed.value);
+};
+
+const toggleThemeFromIcon = () => {
+  settingsStore.setTheme(settingsStore.theme === 'dark' ? 'light' : 'dark');
+};
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ collapsed: isCollapsed }">
     <!-- Agent Connection Panel -->
     <div class="sidebar-section agent-section">
-      <AgentCard 
-        :agentCard="chatStore.agentCard" 
+      <AgentCard
+        :agentCard="chatStore.agentCard"
         :isConnected="chatStore.isConnected"
+        :compact="isCollapsed"
         @connect="chatStore.connect"
         @disconnect="chatStore.disconnect"
-      />
+      >
+        <template #header-action>
+          <ElTooltip
+            :content="isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"
+            placement="right"
+            :show-after="300"
+          >
+            <button class="collapse-button" @click.stop="toggleCollapsed">
+              <Icon :icon="isCollapsed ? 'mdi:chevron-double-right' : 'mdi:chevron-double-left'" />
+            </button>
+          </ElTooltip>
+        </template>
+      </AgentCard>
     </div>
 
     <!-- Conversation History -->
     <div class="sidebar-section conversations-section">
-      <div class="section-header">
+      <div class="section-header" v-if="!isCollapsed">
         <span class="section-title">Conversations</span>
         <div class="section-header-actions">
           <button class="icon-button" @click="handleClearAllConversations" title="Clear all conversations" v-if="chatStore.conversations.length > 0">
@@ -103,65 +126,107 @@ const sortedConversations = computed(() => {
           </button>
         </div>
       </div>
+      <div class="section-header collapsed-header" v-else>
+        <ElTooltip content="New conversation" placement="right" :show-after="300">
+          <button class="icon-button" @click="handleNewChat">
+            <Icon icon="mdi:plus" />
+          </button>
+        </ElTooltip>
+      </div>
       <div class="conversation-list">
         <!-- Current Chat (always first) -->
-        <div
-          class="conversation-item"
-          :class="{ active: chatStore.activeConversationId === null }"
-          @click="handleSwitchToCurrentChat"
+        <ElTooltip
+          :content="chatStore.activeConversationId === null ? 'Current Chat' : 'New Chat'"
+          placement="right"
+          :show-after="300"
+          :disabled="!isCollapsed"
         >
-          <Icon icon="mdi:message-text" class="conversation-icon" />
-          <div class="conversation-info">
-            <div class="conversation-title">{{ chatStore.activeConversationId === null ? 'Current Chat' : 'New Chat' }}</div>
-            <div class="conversation-preview" v-if="chatStore.activeConversationId === null">{{ chatStore.messages.length }} messages</div>
+          <div
+            class="conversation-item"
+            :class="{ active: chatStore.activeConversationId === null }"
+            @click="handleSwitchToCurrentChat"
+          >
+            <Icon icon="mdi:message-text" class="conversation-icon" />
+            <div class="conversation-info" v-if="!isCollapsed">
+              <div class="conversation-title">{{ chatStore.activeConversationId === null ? 'Current Chat' : 'New Chat' }}</div>
+              <div class="conversation-preview" v-if="chatStore.activeConversationId === null">{{ chatStore.messages.length }} messages</div>
+            </div>
           </div>
-        </div>
+        </ElTooltip>
         <!-- Saved conversations -->
-        <div
+        <ElTooltip
           v-for="conv in sortedConversations"
           :key="conv.id"
-          class="conversation-item"
-          :class="{ active: chatStore.activeConversationId === conv.id }"
-          @click="handleSwitchConversation(conv.id)"
+          :content="conv.title"
+          placement="right"
+          :show-after="300"
+          :disabled="!isCollapsed"
         >
-          <Icon icon="mdi:message-text-outline" class="conversation-icon" />
-          <div class="conversation-info">
-            <div class="conversation-title">{{ conv.title }}</div>
-            <div class="conversation-preview">{{ conv.messageCount ?? 0 }} messages</div>
+          <div
+            class="conversation-item"
+            :class="{ active: chatStore.activeConversationId === conv.id }"
+            @click="handleSwitchConversation(conv.id)"
+          >
+            <Icon icon="mdi:message-text-outline" class="conversation-icon" />
+            <div class="conversation-info" v-if="!isCollapsed">
+              <div class="conversation-title">{{ conv.title }}</div>
+              <div class="conversation-preview">{{ conv.messageCount ?? 0 }} messages</div>
+            </div>
+            <button v-if="!isCollapsed" class="delete-conversation-btn" @click="handleDeleteConversation(conv.id, $event)" title="Delete conversation">
+              <Icon icon="mdi:close" />
+            </button>
           </div>
-          <button class="delete-conversation-btn" @click="handleDeleteConversation(conv.id, $event)" title="Delete conversation">
-            <Icon icon="mdi:close" />
-          </button>
-        </div>
+        </ElTooltip>
       </div>
     </div>
 
     <!-- Bottom Actions -->
     <div class="sidebar-section bottom-section">
-      <div class="settings-row" @click="handleOpenSettings">
-        <Icon icon="mdi:cog" class="settings-icon" />
-        <span class="settings-label">Settings</span>
-        <Icon icon="mdi:chevron-right" class="chevron-icon" />
-      </div>
-      <div class="settings-row logout-row" @click="handleLogout">
-        <Icon icon="mdi:logout" class="settings-icon" />
-        <span class="settings-label">Logout</span>
-        <Icon icon="mdi:chevron-right" class="chevron-icon" />
-      </div>
-      <div class="settings-row" @click="handleOpenProcessManager">
-        <Icon icon="mdi:console" class="settings-icon" />
-        <span class="settings-label">Process Manager</span>
-        <Icon icon="mdi:chevron-right" class="chevron-icon" />
-      </div>
-      <div class="theme-row">
-        <Icon icon="mdi:weather-sunny" class="theme-icon" />
-        <span class="theme-label">Dark Mode</span>
-        <ElSwitch 
-          :model-value="settingsStore.theme === 'dark'" 
-          @change="handleThemeToggle"
-          size="small"
-        />
-      </div>
+      <ElTooltip content="Settings" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row" @click="handleOpenSettings">
+          <Icon icon="mdi:cog" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Settings</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
+      <ElTooltip content="Logout" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row logout-row" @click="handleLogout">
+          <Icon icon="mdi:logout" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Logout</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
+      <ElTooltip content="Process Manager" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row" @click="handleOpenProcessManager">
+          <Icon icon="mdi:console" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Process Manager</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
+      <ElTooltip
+        :content="settingsStore.theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
+        placement="right"
+        :show-after="300"
+        :disabled="!isCollapsed"
+      >
+        <div
+          class="theme-row"
+          :class="{ clickable: isCollapsed }"
+          @click="isCollapsed ? toggleThemeFromIcon() : null"
+        >
+          <Icon
+            :icon="settingsStore.theme === 'dark' ? 'mdi:weather-night' : 'mdi:weather-sunny'"
+            class="theme-icon"
+          />
+          <span class="theme-label" v-if="!isCollapsed">Dark Mode</span>
+          <ElSwitch
+            v-if="!isCollapsed"
+            :model-value="settingsStore.theme === 'dark'"
+            @change="handleThemeToggle"
+            size="small"
+          />
+        </div>
+      </ElTooltip>
     </div>
   </aside>
 </template>
@@ -176,6 +241,32 @@ const sortedConversations = computed(() => {
   flex-direction: column;
   overflow-y: auto;
   flex-shrink: 0;
+  transition: width 0.2s ease;
+}
+
+.sidebar.collapsed {
+  width: var(--sidebar-width-collapsed);
+}
+
+.collapse-button {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+  padding: 0;
+  font-size: 18px;
+}
+
+.collapse-button:hover {
+  background: var(--hover-bg);
+  color: var(--primary-color);
 }
 
 .sidebar-section {
@@ -375,6 +466,46 @@ const sortedConversations = computed(() => {
 
 .theme-row:hover {
   background: transparent;
+}
+
+.theme-row.clickable {
+  cursor: pointer;
+}
+
+.theme-row.clickable:hover {
+  background: var(--hover-bg);
+}
+
+/* Collapsed-mode layout overrides */
+.sidebar.collapsed .sidebar-section {
+  padding: 8px 0;
+}
+
+.sidebar.collapsed .agent-section {
+  padding: 0;
+}
+
+.sidebar.collapsed .bottom-section {
+  padding: 8px 0;
+}
+
+.sidebar.collapsed .conversations-section {
+  padding: 8px 0;
+}
+
+.sidebar.collapsed .collapsed-header {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 6px;
+  padding: 0;
+}
+
+.sidebar.collapsed .settings-row,
+.sidebar.collapsed .theme-row,
+.sidebar.collapsed .conversation-item {
+  justify-content: center;
+  padding: 10px 0;
+  gap: 0;
 }
 
 /* Responsive */
