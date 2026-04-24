@@ -30,6 +30,12 @@ let fitAddon: FitAddon | null = null;
 let ws: WebSocket | null = null;
 let resizeObserver: ResizeObserver | null = null;
 
+// Client-side cooked-mode line buffer for non-PTY processes. Pipes don't
+// run through a tty driver, so backspace/DEL bytes (including those an IME
+// like Vietnamese Telex emits when erasing a composition) would otherwise
+// be forwarded verbatim and end up inside the string read by input().
+let inputBuffer = '';
+
 async function loadDefaultSize(): Promise<{ cols: number; rows: number }> {
   try {
     const tool = await getToolConfig(settings.agentUrl, settings.authToken, 'exec_shell');
@@ -40,6 +46,40 @@ async function loadDefaultSize(): Promise<{ cols: number; rows: number }> {
   } catch {
     return { cols: 80, rows: 24 };
   }
+}
+
+// Non-PTY cooked-mode handler: echoes printable chars, processes BS/DEL
+// against the local buffer, and only flushes a completed line (+ \n) to
+// the backend on Enter. Returns the bytes to send.
+function handleNonPtyInput(data: string): string {
+  if (!term) return '';
+  // Normalize CRLF / lone CR to LF so we treat Enter consistently.
+  const norm = data.replace(/\r\n?/g, '\n');
+  let echo = '';
+  let toSend = '';
+  for (const ch of norm) {
+    const code = ch.charCodeAt(0);
+    if (ch === '\n') {
+      toSend += inputBuffer + '\n';
+      inputBuffer = '';
+      echo += '\r\n';
+    } else if (ch === '\x7f' || ch === '\b') {
+      if (inputBuffer.length > 0) {
+        // Slice by code point so a trailing surrogate pair is removed cleanly.
+        const chars = [...inputBuffer];
+        chars.pop();
+        inputBuffer = chars.join('');
+        echo += '\b \b';
+      }
+    } else if (code >= 0x20 && code !== 0x7f) {
+      inputBuffer += ch;
+      echo += ch;
+    }
+    // Other control bytes (arrow keys, ^C, ^D, escape sequences, …) are
+    // dropped — they're not meaningful to a pipe-backed stdin reader.
+  }
+  if (echo) term.write(echo);
+  return toSend;
 }
 
 function writeChunk(stream: string, data: string) {
@@ -104,12 +144,44 @@ onMounted(async () => {
   term.open(termEl.value);
   try { fitAddon.fit(); } catch { /* ignore early-fit race */ }
 
+  // Suppress xterm's automatic replies to host-sent queries (Device
+  // Attributes and Device Status Reports — final bytes 'c', 'n', 'R').
+  // Left enabled, those replies travel out via onData, get written to
+  // the PTY's stdin, and echo right back as visible garbage like
+  // "[?1;2c" or "[O1;2c" at the top of a shell session. Returning true
+  // from a custom handler tells the parser "handled, skip the default",
+  // which is the xterm-sanctioned way to opt out of these responses.
+  term.parser.registerCsiHandler({ final: 'c' }, () => true);
+  term.parser.registerCsiHandler({ final: 'n' }, () => true);
+
   term.onData((data: string) => {
-    // PTYs echo typed characters back through stdout, which the backend
-    // broadcasts back to us — do NOT locally echo or the user sees every
-    // keystroke twice.
+    // TEMP IME diagnostic — remove once Telex/PTY reordering is understood.
+    // Logs each onData event so we can see what bytes xterm actually emits
+    // for a given IME keystroke sequence.
+    // eslint-disable-next-line no-console
+    console.log(
+      '[ProcessTerminal] onData',
+      JSON.stringify(data),
+      'codes=',
+      [...data].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' '),
+      'pty=',
+      isPty.value,
+    );
+
+    // PTY processes already go through the OS tty driver (echo + cooked-mode
+    // line editing), so forward keystrokes raw. Non-PTY processes have no
+    // tty driver; we emulate cooked mode locally so that backspace-and-
+    // compose sequences from IMEs (e.g. Vietnamese Telex) don't end up as
+    // literal \x7f bytes inside the text the program reads.
+    let sendData: string;
+    if (isPty.value) {
+      sendData = data;
+    } else {
+      sendData = handleNonPtyInput(data);
+      if (!sendData) return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'stdin', data }));
+      ws.send(JSON.stringify({ type: 'stdin', data: sendData }));
     }
   });
 
