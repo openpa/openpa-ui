@@ -1,16 +1,56 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
-import { ElSwitch, ElTooltip } from 'element-plus';
+import { ElBadge, ElPopover, ElSwitch, ElTooltip } from 'element-plus';
 import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
+import { useNotificationsStore } from '../stores/notifications';
 import AgentCard from './AgentCard.vue';
+import NotificationList from './NotificationList.vue';
 
 const route = useRoute();
 const router = useRouter();
 const settingsStore = useSettingsStore();
 const chatStore = useChatStore();
+const notificationsStore = useNotificationsStore();
+
+onMounted(() => {
+  notificationsStore.hydrate();
+});
+
+const bellPopoverVisible = ref(false);
+
+const totalUnread = computed(() =>
+  settingsStore.profileId ? notificationsStore.totalUnread(settingsStore.profileId) : 0,
+);
+
+const unreadFor = (conversationId: string): number =>
+  settingsStore.profileId
+    ? notificationsStore.unreadCountForConversation(settingsStore.profileId, conversationId)
+    : 0;
+
+const hasErrorFor = (conversationId: string): boolean =>
+  settingsStore.profileId
+    ? notificationsStore.hasErrorForConversation(settingsStore.profileId, conversationId)
+    : false;
+
+const isStreamingConversation = (conversationId: string): boolean =>
+  chatStore.streamingConversationIds.has(conversationId);
+
+const handleSelectNotification = (conversationId: string) => {
+  bellPopoverVisible.value = false;
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'conversation', params: { profile, conversationId } });
+};
+
+// True when the user is currently in a brand-new (not yet saved) chat.
+// Either nothing has been sent (active === null) or a temp-id is in flight.
+const isOnCurrentChat = computed(() =>
+  chatStore.activeConversationId === null
+  || (chatStore.activeConversationId?.startsWith('temp-') ?? false),
+);
 
 const emit = defineEmits<{
   openSettings: [];
@@ -43,10 +83,11 @@ const handleLogout = () => {
 };
 
 const handleSwitchToCurrentChat = () => {
-  if (chatStore.activeConversationId !== null) {
-    const profile = route.params.profile as string;
-    router.push({ name: 'chat', params: { profile } });
-  }
+  // No-op if we're already on the current/new chat (whether at the empty
+  // landing slot or in a still-temp-id new chat). Otherwise navigate to /.
+  if (isOnCurrentChat.value) return;
+  const profile = route.params.profile as string;
+  router.push({ name: 'chat', params: { profile } });
 };
 
 const handleSwitchConversation = (id: string) => {
@@ -136,20 +177,20 @@ const toggleThemeFromIcon = () => {
       <div class="conversation-list">
         <!-- Current Chat (always first) -->
         <ElTooltip
-          :content="chatStore.activeConversationId === null ? 'Current Chat' : 'New Chat'"
+          :content="isOnCurrentChat ? 'Current Chat' : 'New Chat'"
           placement="right"
           :show-after="300"
           :disabled="!isCollapsed"
         >
           <div
             class="conversation-item"
-            :class="{ active: chatStore.activeConversationId === null }"
+            :class="{ active: isOnCurrentChat }"
             @click="handleSwitchToCurrentChat"
           >
             <Icon icon="mdi:message-text" class="conversation-icon" />
             <div class="conversation-info" v-if="!isCollapsed">
-              <div class="conversation-title">{{ chatStore.activeConversationId === null ? 'Current Chat' : 'New Chat' }}</div>
-              <div class="conversation-preview" v-if="chatStore.activeConversationId === null">{{ chatStore.messages.length }} messages</div>
+              <div class="conversation-title">{{ isOnCurrentChat ? 'Current Chat' : 'New Chat' }}</div>
+              <div class="conversation-preview" v-if="isOnCurrentChat">{{ chatStore.messages.length }} messages</div>
             </div>
           </div>
         </ElTooltip>
@@ -162,26 +203,64 @@ const toggleThemeFromIcon = () => {
           :show-after="300"
           :disabled="!isCollapsed"
         >
-          <div
-            class="conversation-item"
-            :class="{ active: chatStore.activeConversationId === conv.id }"
-            @click="handleSwitchConversation(conv.id)"
+          <ElBadge
+            :value="unreadFor(conv.id)"
+            :hidden="unreadFor(conv.id) === 0"
+            :max="9"
+            :type="hasErrorFor(conv.id) ? 'danger' : 'primary'"
+            class="conversation-badge-wrap"
           >
-            <Icon icon="mdi:message-text-outline" class="conversation-icon" />
-            <div class="conversation-info" v-if="!isCollapsed">
-              <div class="conversation-title">{{ conv.title }}</div>
-              <div class="conversation-preview">{{ conv.messageCount ?? 0 }} messages</div>
+            <div
+              class="conversation-item"
+              :class="{ active: chatStore.activeConversationId === conv.id, streaming: isStreamingConversation(conv.id) }"
+              @click="handleSwitchConversation(conv.id)"
+            >
+              <Icon icon="mdi:message-text-outline" class="conversation-icon" />
+              <span
+                v-if="isStreamingConversation(conv.id)"
+                class="streaming-dot"
+                title="Streaming"
+              />
+              <div class="conversation-info" v-if="!isCollapsed">
+                <div class="conversation-title">{{ conv.title }}</div>
+                <div class="conversation-preview">{{ conv.messageCount ?? 0 }} messages</div>
+              </div>
+              <button v-if="!isCollapsed" class="delete-conversation-btn" @click="handleDeleteConversation(conv.id, $event)" title="Delete conversation">
+                <Icon icon="mdi:close" />
+              </button>
             </div>
-            <button v-if="!isCollapsed" class="delete-conversation-btn" @click="handleDeleteConversation(conv.id, $event)" title="Delete conversation">
-              <Icon icon="mdi:close" />
-            </button>
-          </div>
+          </ElBadge>
         </ElTooltip>
       </div>
     </div>
 
     <!-- Bottom Actions -->
     <div class="sidebar-section bottom-section">
+      <ElPopover
+        :visible="bellPopoverVisible"
+        placement="right-end"
+        trigger="click"
+        :width="320"
+        @update:visible="bellPopoverVisible = $event"
+      >
+        <template #reference>
+          <ElTooltip content="Notifications" placement="right" :show-after="300" :disabled="!isCollapsed">
+            <div class="settings-row notifications-row" @click="bellPopoverVisible = !bellPopoverVisible">
+              <ElBadge
+                :value="totalUnread"
+                :hidden="totalUnread === 0"
+                :max="99"
+                class="notifications-badge"
+              >
+                <Icon icon="mdi:bell-outline" class="settings-icon" />
+              </ElBadge>
+              <span class="settings-label" v-if="!isCollapsed">Notifications</span>
+              <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+            </div>
+          </ElTooltip>
+        </template>
+        <NotificationList @select="handleSelectNotification" />
+      </ElPopover>
       <ElTooltip content="Settings" placement="right" :show-after="300" :disabled="!isCollapsed">
         <div class="settings-row" @click="handleOpenSettings">
           <Icon icon="mdi:cog" class="settings-icon" />
@@ -333,6 +412,55 @@ const toggleThemeFromIcon = () => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* ElBadge wraps content in an inline-block; force it to fill the sidebar
+   width so the conversation row stays full-width. */
+.conversation-badge-wrap {
+  display: block;
+  width: 100%;
+}
+
+.conversation-badge-wrap :deep(.el-badge__content) {
+  z-index: 2;
+}
+
+/* Notifications row in the bottom actions */
+.notifications-row {
+  align-items: center;
+}
+
+.notifications-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.notifications-badge :deep(.el-badge__content) {
+  border: none;
+  font-size: 10px;
+  height: 14px;
+  line-height: 14px;
+  padding: 0 4px;
+}
+
+.streaming-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary-color);
+  animation: pulse 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+  margin-left: -4px;
+}
+
+.conversation-item.streaming .streaming-dot {
+  background: var(--primary-color);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
 }
 
 .conversation-item {

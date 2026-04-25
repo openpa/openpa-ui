@@ -18,6 +18,7 @@ declare module 'vue' {
     LLMParametersForm: typeof import('./src/components/shared/LLMParametersForm.vue')['default']
     MessageBubble: typeof import('./src/components/MessageBubble.vue')['default']
     MessageInput: typeof import('./src/components/MessageInput.vue')['default']
+    NotificationList: typeof import('./src/components/NotificationList.vue')['default']
     ProviderConfigFields: typeof import('./src/components/shared/ProviderConfigFields.vue')['default']
     ResizableDivider: typeof import('./src/components/ResizableDivider.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']

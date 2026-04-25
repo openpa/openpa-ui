@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { getA2AClient, getApiOrigin } from '../services/a2aClient';
 import { useSettingsStore } from './settings';
+import { useNotificationsStore } from './notifications';
 import {
   fetchConversations as apiFetchConversations,
   fetchConversationMessages,
@@ -18,6 +19,9 @@ import type {
   TaskArtifactUpdateEvent,
   Task,
 } from '@a2a-js/sdk';
+
+// Sentinel key for the empty "new chat" landing slot before a temp id is allocated.
+export const NEW_CHAT_KEY = '__new__';
 
 // Conversation history types (now backed by backend API)
 export interface SavedConversation {
@@ -100,34 +104,79 @@ export interface LatencyInfo {
   completedAt?: number;
 }
 
-interface ChatState {
-  messages: ChatMessage[];
+export interface ConversationRuntime {
+  isStreaming: boolean;
+  isSummarizing: boolean;
   currentTaskId: string | undefined;
   currentContextId: string | undefined;
+  startedAt: number;
+}
+
+interface ChatState {
+  messagesByConversation: Record<string, ChatMessage[]>;
+  runtimes: Record<string, ConversationRuntime>;
   agentCard: AgentCard | null;
   agentName: string;
   isConnected: boolean;
-  isStreaming: boolean;
-  isSummarizing: boolean;
   error: string | null;
   conversations: SavedConversation[];
   activeConversationId: string | null;
 }
 
-export const useChatStore = defineStore('chat', {
-  state: (): ChatState => ({
-    messages: [],
+function makeRuntime(): ConversationRuntime {
+  return {
+    isStreaming: false,
+    isSummarizing: false,
     currentTaskId: undefined,
     currentContextId: undefined,
+    startedAt: Date.now(),
+  };
+}
+
+export const useChatStore = defineStore('chat', {
+  state: (): ChatState => ({
+    messagesByConversation: {},
+    runtimes: {},
     agentCard: null,
     agentName: 'Agent',
     isConnected: false,
-    isStreaming: false,
-    isSummarizing: false,
     error: null,
     conversations: [],
     activeConversationId: null,
   }),
+
+  getters: {
+    activeKey(state): string {
+      return state.activeConversationId ?? NEW_CHAT_KEY;
+    },
+    messages(state): ChatMessage[] {
+      const key = state.activeConversationId ?? NEW_CHAT_KEY;
+      return state.messagesByConversation[key] ?? [];
+    },
+    activeRuntime(state): ConversationRuntime | undefined {
+      const key = state.activeConversationId ?? NEW_CHAT_KEY;
+      return state.runtimes[key];
+    },
+    isStreaming(state): boolean {
+      const key = state.activeConversationId ?? NEW_CHAT_KEY;
+      return !!state.runtimes[key]?.isStreaming;
+    },
+    isSummarizing(state): boolean {
+      const key = state.activeConversationId ?? NEW_CHAT_KEY;
+      return !!state.runtimes[key]?.isSummarizing;
+    },
+    /**
+     * Map of conversationId -> isStreaming, used by the sidebar to show
+     * a "live" indicator on background-running conversations.
+     */
+    streamingConversationIds(state): Set<string> {
+      const ids = new Set<string>();
+      for (const [id, rt] of Object.entries(state.runtimes)) {
+        if (rt.isStreaming) ids.add(id);
+      }
+      return ids;
+    },
+  },
 
   actions: {
     /**
@@ -150,13 +199,53 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Send a message to the agent and process streaming responses
+     * Ensure a bucket and runtime exist for the given conversation key.
      */
-    async sendMessage(text: string, options?: { reasoning?: boolean }) {
+    ensureBucket(key: string): { bucket: ChatMessage[]; runtime: ConversationRuntime } {
+      if (!this.messagesByConversation[key]) {
+        this.messagesByConversation[key] = [];
+      }
+      if (!this.runtimes[key]) {
+        this.runtimes[key] = makeRuntime();
+      }
+      return {
+        bucket: this.messagesByConversation[key],
+        runtime: this.runtimes[key],
+      };
+    },
+
+    /**
+     * Send a message to the agent and process streaming responses.
+     * Each conversation runs independently — switching to another conversation
+     * does NOT pause or block this stream. Events route to the correct
+     * conversation via the closure-captured `cid` and `bucket` references.
+     */
+    async sendMessage(text: string, options?: { reasoning?: boolean; conversationId?: string }) {
       if (!text.trim()) return;
 
-      this.isStreaming = true;
       this.error = null;
+
+      // Resolve which conversation this send belongs to.
+      // Precedence: explicit override → active conversation → new temp id.
+      let cid: string =
+        options?.conversationId
+        ?? this.activeConversationId
+        ?? `temp-${this.generateId()}`;
+
+      // If we allocated a brand-new temp id and there's no active conversation,
+      // make this temp the active one so the user sees their message immediately.
+      const allocatedTemp = !options?.conversationId && !this.activeConversationId;
+      if (allocatedTemp) {
+        this.activeConversationId = cid;
+      }
+
+      // Capture closure references — these survive any future activeConversationId
+      // changes or temp→real migrations (we update `cid` below when migrating).
+      const { bucket, runtime } = this.ensureBucket(cid);
+
+      runtime.isStreaming = true;
+      runtime.isSummarizing = false;
+      runtime.startedAt = Date.now();
 
       // Add user message to UI
       const userMessage: ChatMessage = {
@@ -166,7 +255,7 @@ export const useChatStore = defineStore('chat', {
         parts: [{ kind: 'text', text } as Part],
         timestamp: new Date(),
       };
-      this.messages.push(userMessage);
+      bucket.push(userMessage);
 
       // Create assistant message placeholder (will be updated as we stream)
       const requestSentAt = Date.now();
@@ -181,13 +270,14 @@ export const useChatStore = defineStore('chat', {
         artifacts: [],
         latency: { requestSentAt },
       };
-      this.messages.push(assistantMessageRaw);
+      bucket.push(assistantMessageRaw);
 
-      // Get the reactive proxy reference from the store so Vue detects mutations
-      const assistantMessage = this.messages[this.messages.length - 1];
+      // Get the reactive proxy reference so Vue detects mutations
+      const assistantMessage = bucket[bucket.length - 1];
 
       // Track timing milestones
       let hasReceivedFirstEvent = false;
+      let errored = false;
 
       try {
         // Construct message payload
@@ -198,12 +288,13 @@ export const useChatStore = defineStore('chat', {
           parts: [{ kind: 'text', text } as Part],
         };
 
-        // Add taskId and contextId if available
-        if (this.currentTaskId) {
-          messagePayload.taskId = this.currentTaskId;
+        // Add taskId and contextId if available for this conversation's runtime.
+        // For temp ids, contextId is initially undefined — backend assigns one.
+        if (runtime.currentTaskId) {
+          messagePayload.taskId = runtime.currentTaskId;
         }
-        if (this.currentContextId) {
-          messagePayload.contextId = this.currentContextId;
+        if (runtime.currentContextId) {
+          messagePayload.contextId = runtime.currentContextId;
         }
 
         const params: MessageSendParams = {
@@ -218,7 +309,6 @@ export const useChatStore = defineStore('chat', {
 
         // Stream responses with retry (once) on error
         const client = await getA2AClient();
-        console.log('Sending message with payload:', params);
 
         let retried = false;
         while (true) {
@@ -235,35 +325,46 @@ export const useChatStore = defineStore('chat', {
                 console.log('Stream event:', event);
               }
 
+              // Temp-id migration: as soon as the backend reveals a real
+              // contextId on this stream, swap our bucket key from `temp-…`
+              // to the real conversation id. The bucket array reference is
+              // preserved, so handlers keep mutating the right messages.
+              const eventContextId =
+                (event as any).contextId
+                ?? ((event as any).status?.contextId)
+                ?? undefined;
+              if (cid.startsWith('temp-') && eventContextId && typeof eventContextId === 'string') {
+                const realId = await this.migrateTempToReal(cid, eventContextId);
+                if (realId) cid = realId;
+              }
+
               if (event.kind === 'status-update') {
-                this.handleStatusUpdate(event, assistantMessage);
+                this.handleStatusUpdate(event, assistantMessage, runtime);
               } else if (event.kind === 'artifact-update') {
-                // Handle token-by-token text streaming from artifacts
-                const updatedText = this.handleArtifactUpdate(event, assistantMessage, currentTextPart);
+                const updatedText = this.handleArtifactUpdate(event, assistantMessage, runtime, currentTextPart);
                 if (updatedText !== undefined) {
                   currentTextPart = updatedText;
                 }
               } else if (event.kind === 'message') {
-                this.handleMessageEvent(event as Message, assistantMessage);
+                this.handleMessageEvent(event as Message, assistantMessage, runtime);
               } else if (event.kind === 'task') {
-                this.handleTaskEvent(event as Task, assistantMessage);
+                this.handleTaskEvent(event as Task, assistantMessage, runtime);
               }
             }
             break; // Stream completed successfully
           } catch (streamError: any) {
             if (retried) {
-              throw streamError; // Already retried once, propagate to outer catch
+              throw streamError;
             }
             console.warn('Stream error, retrying with cleared context:', streamError);
             retried = true;
 
-            // Clear current context and task ID
-            this.currentContextId = undefined;
-            this.currentTaskId = undefined;
+            // Clear this conversation's context/task and retry once
+            runtime.currentContextId = undefined;
+            runtime.currentTaskId = undefined;
             delete messagePayload.contextId;
             delete messagePayload.taskId;
 
-            // Reset streaming state for retry
             currentTextPart = '';
             hasReceivedFirstEvent = false;
             assistantMessage.content = '';
@@ -281,47 +382,115 @@ export const useChatStore = defineStore('chat', {
         // Finalize message
         assistantMessage.isStreaming = false;
 
-        // Refresh conversation list from backend
+        // Refresh conversation list so a brand-new conversation appears in the sidebar
+        // even if the temp→real migration didn't already trigger a fetch.
         await this.loadConversations();
 
-        // After sending first message in a new chat, activate the newly created conversation
-        if (!this.activeConversationId && this.currentContextId) {
-          const newConv = this.conversations.find(c => c.contextId === this.currentContextId);
-          if (newConv) {
-            this.activeConversationId = newConv.id;
-          }
-        }
-
       } catch (error: any) {
+        errored = true;
         this.error = error.message || 'Failed to send message';
         assistantMessage.content = `Error: ${this.error}`;
         assistantMessage.isStreaming = false;
         console.error('Error sending message:', error);
       } finally {
-        this.isStreaming = false;
-        this.isSummarizing = false;
+        runtime.isStreaming = false;
+        runtime.isSummarizing = false;
+
+        // Push a notification if this conversation isn't the one the user is looking at.
+        if (cid !== this.activeConversationId) {
+          this.pushCompletionNotification(cid, assistantMessage, errored);
+        }
+      }
+    },
+
+    /**
+     * Look up the real conversation row matching `realContextId` and migrate
+     * the temp bucket / runtime under the real conversation id key. Returns
+     * the new key (real conversationId) on success, or undefined if the
+     * conversation row hasn't appeared yet.
+     */
+    async migrateTempToReal(tempId: string, realContextId: string): Promise<string | undefined> {
+      // Reload conversations to find the new row.
+      await this.loadConversations();
+      const conv = this.conversations.find(c => c.contextId === realContextId);
+      if (!conv) {
+        // Backend hasn't persisted it yet — leave as temp; we'll try again
+        // on the next event with a contextId.
+        return undefined;
+      }
+      const realId = conv.id;
+      if (realId === tempId) return realId;
+      if (this.messagesByConversation[realId]) {
+        // A bucket already exists under realId (unlikely). Merge by appending.
+        const tempBucket = this.messagesByConversation[tempId];
+        if (tempBucket) {
+          this.messagesByConversation[realId].push(...tempBucket);
+        }
+      } else {
+        this.messagesByConversation[realId] = this.messagesByConversation[tempId];
+      }
+      if (!this.runtimes[realId]) {
+        this.runtimes[realId] = this.runtimes[tempId];
+      }
+      delete this.messagesByConversation[tempId];
+      delete this.runtimes[tempId];
+      if (this.activeConversationId === tempId) {
+        this.activeConversationId = realId;
+      }
+      return realId;
+    },
+
+    /**
+     * Push a notification entry for a non-active conversation that just
+     * finished (or errored). Uses the conversation's title from the saved
+     * list; falls back to a generic label for unmigrated temp ids.
+     */
+    pushCompletionNotification(conversationId: string, assistantMessage: ChatMessage, errored: boolean) {
+      const settings = useSettingsStore();
+      const profile = settings.profileId;
+      if (!profile) return;
+      const conv = this.conversations.find(c => c.id === conversationId);
+      const title = conv?.title ?? 'New conversation';
+      const previewSource = errored
+        ? assistantMessage.content
+        : (assistantMessage.content || '(empty response)');
+      const preview = previewSource.slice(0, 80);
+      try {
+        useNotificationsStore().push(profile, {
+          id: this.generateId(),
+          conversationId,
+          conversationTitle: title,
+          messagePreview: preview,
+          kind: errored ? 'error' : 'completed',
+          createdAt: Date.now(),
+          seen: false,
+        });
+      } catch (e) {
+        console.warn('Failed to push notification:', e);
       }
     },
 
     /**
      * Stop the in-flight conversation. Tells the backend to cancel the
      * running task; flips the UI optimistically so the button morphs back
-     * instantly. The streaming for-await loop in sendMessage() will exit
-     * naturally as the backend closes the stream.
+     * instantly. Defaults to the active conversation; pass `conversationId`
+     * to stop a specific background stream.
      */
-    async stopMessage() {
-      const taskId = this.currentTaskId;
-      // Optimistic UI flip — even if the network call fails, the user sees
-      // the button revert immediately.
-      this.isStreaming = false;
-      this.isSummarizing = false;
-      const last = this.messages[this.messages.length - 1];
+    async stopMessage(conversationId?: string) {
+      const cid = conversationId ?? this.activeConversationId ?? NEW_CHAT_KEY;
+      const runtime = this.runtimes[cid];
+      const bucket = this.messagesByConversation[cid];
+      if (!runtime) return;
+
+      const taskId = runtime.currentTaskId;
+      runtime.isStreaming = false;
+      runtime.isSummarizing = false;
+      const last = bucket?.[bucket.length - 1];
       if (last?.role === 'assistant') {
         last.isStreaming = false;
       }
 
       if (!taskId) {
-        // Stop pressed before the first stream event registered a task id.
         return;
       }
 
@@ -339,15 +508,14 @@ export const useChatStore = defineStore('chat', {
     /**
      * Handle status update events
      */
-    handleStatusUpdate(event: TaskStatusUpdateEvent, message: ChatMessage) {
+    handleStatusUpdate(event: TaskStatusUpdateEvent, message: ChatMessage, runtime: ConversationRuntime) {
       message.state = event.status.state;
 
-      // Update task/context IDs
       if (event.taskId) {
-        this.currentTaskId = event.taskId;
+        runtime.currentTaskId = event.taskId;
       }
       if (event.contextId) {
-        this.currentContextId = event.contextId;
+        runtime.currentContextId = event.contextId;
       }
 
       // Only extract text from status message if we don't already have
@@ -359,7 +527,7 @@ export const useChatStore = defineStore('chat', {
       // Clear task ID if final and not waiting for input
       if (event.final && event.status.state !== 'input-required') {
         console.log('Task completed, clearing task ID');
-        this.currentTaskId = undefined;
+        runtime.currentTaskId = undefined;
       }
     },
 
@@ -368,16 +536,16 @@ export const useChatStore = defineStore('chat', {
      * Optimized for token-by-token streaming from "Text Response" artifacts
      */
     handleArtifactUpdate(
-      event: TaskArtifactUpdateEvent, 
-      message: ChatMessage, 
+      event: TaskArtifactUpdateEvent,
+      message: ChatMessage,
+      runtime: ConversationRuntime,
       currentTextPart: string
     ): string | undefined {
-      // Update task/context IDs
       if (event.taskId) {
-        this.currentTaskId = event.taskId;
+        runtime.currentTaskId = event.taskId;
       }
       if (event.contextId) {
-        this.currentContextId = event.contextId;
+        runtime.currentContextId = event.contextId;
       }
 
       const artifact = event.artifact;
@@ -385,38 +553,29 @@ export const useChatStore = defineStore('chat', {
         return undefined;
       }
 
-      // Special handling for authentication token artifacts
       if (artifact.name === 'token') {
         this.handleTokenArtifact(artifact.parts);
         return undefined;
       }
 
-      // Track if we found any content in this artifact
       let foundContent = false;
 
       for (const part of artifact.parts) {
-        // Handle text parts - optimized for token-by-token streaming
         if ('text' in part && typeof part.text === 'string') {
-          // Token-by-token streaming from "Text Response" artifact
           if (artifact.name === 'Text Response' || event.append) {
-            // Append mode: accumulate tokens as they arrive
             currentTextPart += part.text;
-            
-            // Capture first token latency
+
             if (message.latency && !message.latency.firstTokenAt && part.text.length > 0) {
               message.latency.firstTokenAt = Date.now();
             }
           } else {
-            // Replace mode: set as new text (rarely used for streaming)
             currentTextPart = part.text;
           }
-          
-          // Update message content reactively for Vue
+
           message.content = this.buildMessageContent(message, currentTextPart);
           foundContent = true;
         }
 
-        // Handle file parts (file artifacts from system_file tool)
         if ('file' in part && typeof part.file === 'object' && part.file) {
           const fileObj = part.file as any;
           const attachment: FileAttachment = {
@@ -430,12 +589,10 @@ export const useChatStore = defineStore('chat', {
           foundContent = true;
         }
 
-        // Handle data parts (thinking, result, token_usage)
         if ('data' in part && typeof part.data === 'object') {
           const data = part.data as any;
 
           if (artifact.name === 'thinking') {
-            // Thinking artifact: { Thought, Action, Action_Input, Model_Label, Reasoning_Model_Label }
             const stepReceivedAt = Date.now();
             const thinkingStep: ThinkingStep = {
               thought: data.Thought || '',
@@ -447,25 +604,21 @@ export const useChatStore = defineStore('chat', {
             message.thinkingSteps = message.thinkingSteps || [];
             message.thinkingSteps.push(thinkingStep);
 
-            // Set reasoning model label from first thinking artifact
             if (!message.reasoningModelLabel && data.Reasoning_Model_Label) {
               message.reasoningModelLabel = data.Reasoning_Model_Label;
             }
 
-            // Capture first step latency
             if (message.latency && !message.latency.firstStepAt) {
               message.latency.firstStepAt = stepReceivedAt;
             }
-            
+
             message.content = this.buildMessageContent(message, currentTextPart);
             foundContent = true;
           } else if (artifact.name === 'result') {
-            // Result artifact: attach observation parts (list[Part]) to the latest thinking step
             const observationParts: ObservationPart[] = Array.isArray(data.Observation)
               ? data.Observation
               : [{ kind: 'text', text: typeof data.Observation === 'string' ? data.Observation : JSON.stringify(data.Observation) }];
             if (message.thinkingSteps && message.thinkingSteps.length > 0) {
-              // Find the latest thinking step without an observation
               const unresolvedStep = [...message.thinkingSteps]
                 .reverse()
                 .find(s => !s.observation);
@@ -476,7 +629,6 @@ export const useChatStore = defineStore('chat', {
             message.content = this.buildMessageContent(message, currentTextPart);
             foundContent = true;
           } else if (artifact.name === 'token_usage' && 'token_usage' in data) {
-            // Token usage artifact
             const usage = data.token_usage;
             message.tokenUsage = {
               inputTokens: usage.input_tokens || 0,
@@ -486,17 +638,13 @@ export const useChatStore = defineStore('chat', {
             message.content = this.buildMessageContent(message, currentTextPart);
             foundContent = true;
           } else if (artifact.name === 'summary' && typeof data.summary === 'string') {
-            // Reasoning summary artifact (emitted after the Final Answer Tool)
             message.summary = data.summary;
-            // Summary arrived; clear the summarizing indicator.
-            this.isSummarizing = false;
+            runtime.isSummarizing = false;
             message.content = this.buildMessageContent(message, currentTextPart);
             foundContent = true;
           } else if (artifact.name === 'phase' && typeof data.phase === 'string') {
-            // Phase signal used to swap the streaming indicator label
-            // ("Agent is thinking..." → "Agent is summarizing...").
             console.log('[indicator] phase artifact received:', data.phase);
-            this.isSummarizing = data.phase === 'summarizing';
+            runtime.isSummarizing = data.phase === 'summarizing';
             foundContent = true;
           } else if (artifact.name === 'terminal' && typeof data.process_id === 'string') {
             const attachment: TerminalAttachment = {
@@ -514,7 +662,6 @@ export const useChatStore = defineStore('chat', {
             foundContent = true;
           } else {
             console.log('[indicator] generic data artifact:', { name: artifact.name, data });
-            // Generic data artifact
             const artifactInfo: ArtifactInfo = {
               name: artifact.name || 'unknown',
               artifactId: artifact.artifactId || this.generateId(),
@@ -529,7 +676,6 @@ export const useChatStore = defineStore('chat', {
         }
       }
 
-      // Return updated text content if we found any
       return foundContent ? currentTextPart : undefined;
     },
 
@@ -541,7 +687,6 @@ export const useChatStore = defineStore('chat', {
         if ('text' in part && typeof part.text === 'string') {
           const token = part.text;
           try {
-            // Save token to localStorage (similar to client_host.py storage)
             localStorage.setItem(`a2a_agent_token_${this.agentName}`, token);
             console.log(`Token saved for agent: ${this.agentName}`);
           } catch (e) {
@@ -554,12 +699,12 @@ export const useChatStore = defineStore('chat', {
     /**
      * Handle message events from stream
      */
-    handleMessageEvent(event: Message, message: ChatMessage) {
+    handleMessageEvent(event: Message, message: ChatMessage, runtime: ConversationRuntime) {
       if (event.taskId) {
-        this.currentTaskId = event.taskId;
+        runtime.currentTaskId = event.taskId;
       }
       if (event.contextId) {
-        this.currentContextId = event.contextId;
+        runtime.currentContextId = event.contextId;
       }
 
       this.extractTextFromParts(event.parts, message);
@@ -568,12 +713,12 @@ export const useChatStore = defineStore('chat', {
     /**
      * Handle task events from stream
      */
-    handleTaskEvent(event: Task, message: ChatMessage) {
+    handleTaskEvent(event: Task, message: ChatMessage, runtime: ConversationRuntime) {
       if (event.id) {
-        this.currentTaskId = event.id;
+        runtime.currentTaskId = event.id;
       }
       if (event.contextId) {
-        this.currentContextId = event.contextId;
+        runtime.currentContextId = event.contextId;
       }
 
       message.state = event.status.state;
@@ -599,8 +744,6 @@ export const useChatStore = defineStore('chat', {
      * Combines streaming text tokens with thinking steps and results
      */
     buildMessageContent(_message: ChatMessage, currentTextPart: string): string {
-      // Only return the accumulated text response.
-      // Thinking steps and results are displayed separately via the timeline component.
       return currentTextPart;
     },
 
@@ -625,15 +768,19 @@ export const useChatStore = defineStore('chat', {
 
     /**
      * Reset all chat state for a profile switch, then reconnect.
+     * Cancels every in-flight stream first.
      */
     async resetForProfileSwitch() {
-      this.messages = [];
-      this.currentTaskId = undefined;
-      this.currentContextId = undefined;
+      for (const id of Object.keys(this.runtimes)) {
+        if (this.runtimes[id].isStreaming) {
+          await this.stopMessage(id);
+        }
+      }
+      this.messagesByConversation = {};
+      this.runtimes = {};
       this.activeConversationId = null;
       this.conversations = [];
       this.error = null;
-      this.isStreaming = false;
 
       if (this.isConnected) {
         this.disconnect();
@@ -673,10 +820,24 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Switch to a saved conversation (loads messages from backend)
+     * Switch to a saved conversation. If we already have an in-flight
+     * stream for it (or in-memory messages), keep them — otherwise fetch
+     * from the backend.
      */
     async switchConversation(id: string) {
       if (id === this.activeConversationId) return;
+
+      const hasBucket = !!this.messagesByConversation[id];
+      const isStreaming = !!this.runtimes[id]?.isStreaming;
+
+      if (hasBucket && isStreaming) {
+        // Don't refetch — backend hasn't persisted partial state yet, and we'd
+        // clobber the live stream's messages.
+        this.activeConversationId = id;
+        this.error = null;
+        useNotificationsStore().markSeenForConversation(useSettingsStore().profileId, id);
+        return;
+      }
 
       try {
         const settingsStore = useSettingsStore();
@@ -685,11 +846,15 @@ export const useChatStore = defineStore('chat', {
 
         const { conversation, messages } = await fetchConversationMessages(agentUrl, authToken, id);
 
-        this.messages = messages.map(this.mapBackendMessage);
-        this.currentTaskId = conversation.task_id ?? undefined;
-        this.currentContextId = conversation.context_id ?? undefined;
+        this.messagesByConversation[id] = messages.map(this.mapBackendMessage);
+        const runtime = this.runtimes[id] ?? makeRuntime();
+        runtime.currentTaskId = conversation.task_id ?? undefined;
+        runtime.currentContextId = conversation.context_id ?? undefined;
+        // isStreaming stays as-is (false for a freshly-loaded conversation)
+        this.runtimes[id] = runtime;
         this.activeConversationId = id;
         this.error = null;
+        useNotificationsStore().markSeenForConversation(settingsStore.profileId, id);
       } catch (e) {
         console.error('Failed to switch conversation:', e);
       }
@@ -709,7 +874,6 @@ export const useChatStore = defineStore('chat', {
           }))
         : undefined;
 
-      // Derive reasoning model label from first step that has it
       const reasoningModelLabel = msg.thinking_steps
         ?.find(s => s.reasoning_model_label)?.reasoning_model_label ?? undefined;
 
@@ -721,7 +885,6 @@ export const useChatStore = defineStore('chat', {
           }
         : undefined;
 
-      // Extract file attachments from persisted parts (only FileParts are stored)
       const fileAttachments: FileAttachment[] | undefined = msg.parts
         ? msg.parts
             .filter((p: any) => p.kind === 'file' && p.file)
@@ -732,7 +895,6 @@ export const useChatStore = defineStore('chat', {
             }))
         : undefined;
 
-      // Extract terminal attachments persisted as DataParts with the terminal shape
       const terminalAttachments: TerminalAttachment[] | undefined = msg.parts
         ? msg.parts
             .filter((p: any) => p.kind === 'data' && p.data && typeof p.data.process_id === 'string')
@@ -762,34 +924,32 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Switch to a new (empty) current chat
+     * Switch to the empty "new chat" landing slot. Does not affect
+     * any in-flight streams in other conversations (or temp-id streams);
+     * they keep running in the background.
      */
     switchToNewChat() {
-      if (this.activeConversationId === null && this.messages.length === 0) return;
-
-      this.messages = [];
-      this.currentTaskId = undefined;
-      this.currentContextId = undefined;
       this.activeConversationId = null;
       this.error = null;
     },
 
     /**
-     * Clear conversation and reset state (New Chat button)
+     * "New Chat" button. Identical to switchToNewChat — kept as a separate
+     * method so existing callers (App.vue) don't need to change semantics.
      */
     clearConversation() {
-      console.log('Clearing conversation');
-      this.messages = [];
-      this.currentTaskId = undefined;
-      this.currentContextId = undefined;
       this.activeConversationId = null;
       this.error = null;
     },
 
     /**
-     * Delete a single saved conversation (from backend)
+     * Delete a single saved conversation. If it's currently streaming,
+     * cancel its stream first.
      */
     async deleteConversation(id: string) {
+      if (this.runtimes[id]?.isStreaming) {
+        await this.stopMessage(id);
+      }
       try {
         const settingsStore = useSettingsStore();
         await apiDeleteConversation(settingsStore.agentUrl, settingsStore.authToken, id);
@@ -797,18 +957,26 @@ export const useChatStore = defineStore('chat', {
         console.error('Failed to delete conversation:', e);
       }
       this.conversations = this.conversations.filter(c => c.id !== id);
+      delete this.messagesByConversation[id];
+      delete this.runtimes[id];
+      const settingsStore = useSettingsStore();
+      if (settingsStore.profileId) {
+        useNotificationsStore().clearForConversation(settingsStore.profileId, id);
+      }
       if (this.activeConversationId === id) {
-        this.messages = [];
-        this.currentTaskId = undefined;
-        this.currentContextId = undefined;
         this.activeConversationId = null;
       }
     },
 
     /**
-     * Clear all saved conversations (from backend)
+     * Clear all saved conversations. Cancels every in-flight stream first.
      */
     async clearAllConversations() {
+      for (const id of Object.keys(this.runtimes)) {
+        if (this.runtimes[id].isStreaming) {
+          await this.stopMessage(id);
+        }
+      }
       try {
         const settingsStore = useSettingsStore();
         const profile = settingsStore.profileId;
@@ -818,11 +986,14 @@ export const useChatStore = defineStore('chat', {
       } catch (e) {
         console.error('Failed to clear conversations:', e);
       }
+      const settings = useSettingsStore();
+      if (settings.profileId) {
+        useNotificationsStore().clearAll(settings.profileId);
+      }
       this.conversations = [];
       this.activeConversationId = null;
-      this.messages = [];
-      this.currentTaskId = undefined;
-      this.currentContextId = undefined;
+      this.messagesByConversation = {};
+      this.runtimes = {};
       this.error = null;
     },
 
