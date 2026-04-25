@@ -2,10 +2,14 @@
 import { onMounted, computed, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElNotification } from 'element-plus';
+import { Icon } from '@iconify/vue';
 import { useChatStore } from '../stores/chat';
 import { useSettingsStore } from '../stores/settings';
+import { useTerminalPanelStore } from '../stores/terminalPanel';
 import ChatWindow from '../components/ChatWindow.vue';
 import MessageInput from '../components/MessageInput.vue';
+import TerminalPanel from '../components/TerminalPanel.vue';
+import ResizableDivider from '../components/ResizableDivider.vue';
 
 const props = defineProps<{
   profile?: string;
@@ -15,6 +19,14 @@ const props = defineProps<{
 const router = useRouter();
 const chatStore = useChatStore();
 const settingsStore = useSettingsStore();
+const terminalPanel = useTerminalPanelStore();
+
+const showTerminalPanel = computed(
+  () => terminalPanel.openTerminals.length > 0 && !terminalPanel.minimized,
+);
+const showMinimizedPill = computed(
+  () => terminalPanel.openTerminals.length > 0 && terminalPanel.minimized,
+);
 
 // Detect if running in Electron
 const isElectron = computed(() => {
@@ -97,22 +109,40 @@ const handleSendMessage = async (text: string) => {
 </script>
 
 <template>
-  <div class="chat-view" :class="{ 'has-titlebar': isElectron }">
-    <!-- Chat messages area -->
-    <ChatWindow
-      :messages="chatStore.messages"
-      :isStreaming="chatStore.isStreaming"
-    />
+  <div class="chat-view" :class="{ 'has-titlebar': isElectron, split: showTerminalPanel }">
+    <div class="chat-section">
+      <ChatWindow
+        :messages="chatStore.messages"
+        :isStreaming="chatStore.isStreaming"
+      />
 
-    <!-- Message input -->
-    <MessageInput
-      :disabled="!chatStore.isConnected || chatStore.isStreaming"
-      :isProcessing="chatStore.isStreaming"
-      :reasoningEnabled="settingsStore.reasoningEnabled"
-      @update:reasoningEnabled="settingsStore.setReasoningEnabled(settingsStore.profileId, $event)"
-      @send="handleSendMessage"
-      @stop="chatStore.stopMessage()"
-    />
+      <MessageInput
+        :disabled="!chatStore.isConnected || chatStore.isStreaming"
+        :isProcessing="chatStore.isStreaming"
+        :reasoningEnabled="settingsStore.reasoningEnabled"
+        @update:reasoningEnabled="settingsStore.setReasoningEnabled(settingsStore.profileId, $event)"
+        @send="handleSendMessage"
+        @stop="chatStore.stopMessage()"
+      />
+
+      <button
+        v-if="showMinimizedPill"
+        class="terminal-restore-pill"
+        :title="'Restore terminals'"
+        @click="terminalPanel.restore()"
+      >
+        <Icon icon="mdi:console" />
+        <span>Terminals ({{ terminalPanel.openTerminals.length }})</span>
+      </button>
+    </div>
+
+    <template v-if="showTerminalPanel">
+      <ResizableDivider @update:width="terminalPanel.setWidth" />
+      <TerminalPanel
+        class="terminal-panel-host"
+        :style="{ width: terminalPanel.panelWidth + 'px' }"
+      />
+    </template>
   </div>
 </template>
 
@@ -123,5 +153,47 @@ const handleSendMessage = async (text: string) => {
   height: 100%;
   width: 100%;
   overflow: hidden;
+}
+
+/* When the terminal panel is visible, switch to a horizontal split layout. */
+.chat-view.split {
+  flex-direction: row;
+}
+
+.chat-section {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.terminal-panel-host {
+  flex-shrink: 0;
+  height: 100%;
+}
+
+.terminal-restore-pill {
+  position: absolute;
+  right: 16px;
+  bottom: 72px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #0f172a;
+  color: #cbd5f5;
+  border: 1px solid #1f2937;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+}
+.terminal-restore-pill:hover {
+  border-color: var(--primary-color);
+  color: #e5e7eb;
 }
 </style>

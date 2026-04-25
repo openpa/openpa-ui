@@ -37,6 +37,14 @@ export interface FileAttachment {
   uri: string;
 }
 
+export interface TerminalAttachment {
+  processId: string;
+  command: string;
+  commandShort: string;
+  workingDirectory?: string;
+  pty?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -48,6 +56,7 @@ export interface ChatMessage {
   thinkingSteps?: ThinkingStep[];
   artifacts?: ArtifactInfo[];
   fileAttachments?: FileAttachment[];
+  terminalAttachments?: TerminalAttachment[];
   tokenUsage?: TokenUsage;
   latency?: LatencyInfo;
   reasoningModelLabel?: string;
@@ -489,6 +498,20 @@ export const useChatStore = defineStore('chat', {
             console.log('[indicator] phase artifact received:', data.phase);
             this.isSummarizing = data.phase === 'summarizing';
             foundContent = true;
+          } else if (artifact.name === 'terminal' && typeof data.process_id === 'string') {
+            const attachment: TerminalAttachment = {
+              processId: data.process_id,
+              command: data.command || '',
+              commandShort: data.command_short || data.command || '',
+              workingDirectory: data.working_directory || '',
+              pty: Boolean(data.pty),
+            };
+            message.terminalAttachments = message.terminalAttachments || [];
+            if (!message.terminalAttachments.some(t => t.processId === attachment.processId)) {
+              message.terminalAttachments.push(attachment);
+            }
+            message.content = this.buildMessageContent(message, currentTextPart);
+            foundContent = true;
           } else {
             console.log('[indicator] generic data artifact:', { name: artifact.name, data });
             // Generic data artifact
@@ -709,6 +732,19 @@ export const useChatStore = defineStore('chat', {
             }))
         : undefined;
 
+      // Extract terminal attachments persisted as DataParts with the terminal shape
+      const terminalAttachments: TerminalAttachment[] | undefined = msg.parts
+        ? msg.parts
+            .filter((p: any) => p.kind === 'data' && p.data && typeof p.data.process_id === 'string')
+            .map((p: any) => ({
+              processId: p.data.process_id,
+              command: p.data.command || '',
+              commandShort: p.data.command_short || p.data.command || '',
+              workingDirectory: p.data.working_directory || '',
+              pty: Boolean(p.data.pty),
+            }))
+        : undefined;
+
       return {
         id: msg.id,
         role: msg.role === 'agent' ? 'assistant' : 'user',
@@ -719,6 +755,7 @@ export const useChatStore = defineStore('chat', {
         thinkingSteps,
         tokenUsage,
         fileAttachments: fileAttachments && fileAttachments.length > 0 ? fileAttachments : undefined,
+        terminalAttachments: terminalAttachments && terminalAttachments.length > 0 ? terminalAttachments : undefined,
         reasoningModelLabel,
         summary: msg.summary ?? undefined,
       };

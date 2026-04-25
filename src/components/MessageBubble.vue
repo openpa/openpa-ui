@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import type { ChatMessage, FileAttachment } from '../stores/chat';
+import type { ChatMessage, FileAttachment, TerminalAttachment } from '../stores/chat';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
 import vLinkBlank from '../directives/v-link-blank';
 import { Icon } from '@iconify/vue';
 import { useSettingsStore } from '../stores/settings';
+import { useTerminalPanelStore } from '../stores/terminalPanel';
 
 const props = defineProps<{
   message: ChatMessage;
@@ -224,6 +225,21 @@ const getFileIcon = (mime: string): string => {
 const fileAttachments = computed<FileAttachment[]>(() => {
   return props.message.fileAttachments || [];
 });
+
+// Terminal attachments (long-running processes started by exec_shell)
+const terminalAttachments = computed<TerminalAttachment[]>(() => {
+  return props.message.terminalAttachments || [];
+});
+
+const hasCarouselContent = computed(
+  () => fileAttachments.value.length > 0 || terminalAttachments.value.length > 0,
+);
+
+const terminalPanel = useTerminalPanelStore();
+
+const openTerminal = (term: TerminalAttachment) => {
+  terminalPanel.openTerminal(term);
+};
 
 // Collapse state for thinking process timeline
 const activeCollapse = ref<string[]>([]);
@@ -445,8 +461,19 @@ const handleThinkingClick = (event: MouseEvent) => {
       </div>
 
       <!-- File attachments carousel (bottom of bubble) -->
-      <div v-if="fileAttachments.length" class="file-carousel-section">
+      <div v-if="hasCarouselContent" class="file-carousel-section">
         <div class="file-carousel">
+          <div
+            v-for="term in terminalAttachments"
+            :key="`term-${term.processId}`"
+            class="file-chip terminal-chip"
+            :title="term.command"
+            role="button"
+            @click="openTerminal(term)"
+          >
+            <Icon icon="mdi:console" class="file-chip-icon terminal-icon" />
+            <span class="file-chip-name">{{ term.commandShort || term.command }}</span>
+          </div>
           <div v-for="(file, fIdx) in fileAttachments" :key="fIdx" class="file-chip" :class="{ 'file-chip-image': isImageMime(file.mimeType) }">
             <!-- Image thumbnail -->
             <img v-if="isImageMime(file.mimeType)" :src="resolveFileUrl(file.uri)" :alt="file.name" class="file-chip-thumb" loading="lazy" />
@@ -1167,6 +1194,22 @@ const handleThinkingClick = (event: MouseEvent) => {
 }
 .file-chip-icon.pdf-icon { color: #e53935; }
 .file-chip-icon.text-icon { color: var(--primary-color); }
+
+/* Terminal chip — console-icon variant, clickable */
+.file-chip.terminal-chip {
+  background: #0f172a;
+  border-color: #1f2937;
+  cursor: pointer;
+}
+.file-chip.terminal-chip:hover {
+  border-color: var(--primary-color);
+  background: #111a2e;
+}
+.file-chip.terminal-chip .file-chip-name {
+  color: #cbd5f5;
+  font-family: Consolas, Monaco, "Courier New", monospace;
+}
+.file-chip-icon.terminal-icon { color: #22c55e; }
 
 .file-chip-name {
   font-size: 0.78rem;
