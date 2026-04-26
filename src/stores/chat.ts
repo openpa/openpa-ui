@@ -7,20 +7,40 @@ import {
   fetchConversationMessages,
   deleteConversation as apiDeleteConversation,
   deleteAllConversations as apiDeleteAllConversations,
+  createConversation as apiCreateConversation,
+  sendMessageRequest,
+  cancelTask,
 } from '../services/conversationApi';
-import type { ConversationSummary, MessageRecord } from '../services/conversationApi';
-import type {
-  AgentCard,
-  Message,
-  MessageSendParams,
-  Part,
-  TaskState,
-  TaskStatusUpdateEvent,
-  TaskArtifactUpdateEvent,
-  Task,
-} from '@a2a-js/sdk';
+import type { MessageRecord } from '../services/conversationApi';
+import {
+  openConversationStream,
+  type ConversationStreamEvent,
+  type ConversationStreamHandle,
+} from '../services/conversationStream';
+import type { AgentCard, Part, TaskState } from '@a2a-js/sdk';
 
-// Sentinel key for the empty "new chat" landing slot before a temp id is allocated.
+// Non-reactive per-conversation state for the live SSE subscription. Kept
+// outside the Pinia store so the SSE handle (an unserializable AbortController
+// wrapper) and per-stream scratch state aren't trapped in Vue's reactivity.
+//
+// The lifecycle is REFERENCE-COUNTED: a conversation's stream stays open as
+// long as at least one "tracker" wants it. Trackers include the active view
+// ('active'), the streaming runtime ('streaming'), and any explicit holds
+// ('manual'). Switching to Settings or another conversation drops the
+// 'active' tracker but leaves 'streaming' in place, so background streams
+// keep flowing into the bucket and the user sees them when they come back.
+interface StreamScratch {
+  handle: ConversationStreamHandle;
+  seqSeen: Set<number>;
+  currentTextPart: string;
+  // Active tracker reasons. The handle is closed only when this set empties.
+  trackers: Set<TrackReason>;
+}
+const streamScratch = new Map<string, StreamScratch>();
+
+type TrackReason = 'active' | 'streaming' | 'manual';
+
+// Sentinel key for the empty "new chat" landing slot before a real id is allocated.
 export const NEW_CHAT_KEY = '__new__';
 
 // Conversation history types (now backed by backend API)
@@ -110,6 +130,9 @@ export interface ConversationRuntime {
   currentTaskId: string | undefined;
   currentContextId: string | undefined;
   startedAt: number;
+  // ID of the assistant ChatMessage currently being filled in by the
+  // SSE stream. `undefined` between runs.
+  streamingAssistantId?: string;
 }
 
 interface ChatState {
@@ -180,7 +203,9 @@ export const useChatStore = defineStore('chat', {
 
   actions: {
     /**
-     * Fetch agent card to get agent info and verify connectivity
+     * Fetch agent card to get agent info and verify connectivity.
+     * The agent card is the only thing we still get via the A2A SDK
+     * (purely for backwards compat; could be replaced with a plain GET).
      */
     async fetchAgentCard() {
       try {
@@ -215,41 +240,66 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Send a message to the agent and process streaming responses.
-     * Each conversation runs independently — switching to another conversation
-     * does NOT pause or block this stream. Events route to the correct
-     * conversation via the closure-captured `cid` and `bucket` references.
+     * Send a message to the agent: creates a conversation if we're in the
+     * "new chat" landing slot, POSTs the message (server enqueues a fire-
+     * and-forget agent run), and ensures an SSE subscription is open. The
+     * actual streaming happens through the SSE handler below — this method
+     * returns once the POST succeeds, NOT when the run finishes.
      */
     async sendMessage(text: string, options?: { reasoning?: boolean; conversationId?: string }) {
       if (!text.trim()) return;
 
       this.error = null;
 
-      // Resolve which conversation this send belongs to.
-      // Precedence: explicit override → active conversation → new temp id.
-      let cid: string =
-        options?.conversationId
-        ?? this.activeConversationId
-        ?? `temp-${this.generateId()}`;
-
-      // If we allocated a brand-new temp id and there's no active conversation,
-      // make this temp the active one so the user sees their message immediately.
-      const allocatedTemp = !options?.conversationId && !this.activeConversationId;
-      if (allocatedTemp) {
-        this.activeConversationId = cid;
+      const settings = useSettingsStore();
+      const agentUrl = settings.agentUrl;
+      const authToken = settings.authToken;
+      const profile = settings.profileId;
+      if (!profile) {
+        this.error = 'No active profile';
+        return;
       }
 
-      // Capture closure references — these survive any future activeConversationId
-      // changes or temp→real migrations (we update `cid` below when migrating).
+      // Resolve target conversation. Three cases:
+      //   1. caller specified one → use it
+      //   2. there's an active conversation → use it
+      //   3. neither → create a new one upfront so the POST has a real id
+      let cid = options?.conversationId ?? this.activeConversationId ?? null;
+      let createdNew = false;
+      if (!cid) {
+        try {
+          const conv = await apiCreateConversation(agentUrl, authToken);
+          cid = conv.id;
+          createdNew = true;
+          // Inject into the saved-conversations list so the sidebar shows it
+          // immediately, even before the first event arrives.
+          this.conversations = [
+            {
+              id: conv.id,
+              title: conv.title,
+              contextId: conv.context_id ?? undefined,
+              taskId: conv.task_id ?? undefined,
+              createdAt: conv.created_at,
+              updatedAt: conv.updated_at,
+              messageCount: 0,
+            },
+            ...this.conversations,
+          ];
+        } catch (e: any) {
+          this.error = e?.message || 'Failed to create conversation';
+          console.error('Failed to create conversation:', e);
+          return;
+        }
+      }
+
       const { bucket, runtime } = this.ensureBucket(cid);
 
-      runtime.isStreaming = true;
-      runtime.isSummarizing = false;
-      runtime.startedAt = Date.now();
-
-      // Add user message to UI
+      // Optimistically render the user message so the input clears at once
+      // and the user sees instant feedback. The server will also emit a
+      // `user_message` SSE event with the persisted id; the handler dedupes.
+      const optimisticUserId = this.generateId();
       const userMessage: ChatMessage = {
-        id: this.generateId(),
+        id: optimisticUserId,
         role: 'user',
         content: text,
         parts: [{ kind: 'text', text } as Part],
@@ -257,216 +307,54 @@ export const useChatStore = defineStore('chat', {
       };
       bucket.push(userMessage);
 
-      // Create assistant message placeholder (will be updated as we stream)
-      const requestSentAt = Date.now();
-      const assistantMessageRaw: ChatMessage = {
-        id: this.generateId(),
-        role: 'assistant',
-        content: '',
-        parts: [],
-        timestamp: new Date(),
-        isStreaming: true,
-        thinkingSteps: [],
-        artifacts: [],
-        latency: { requestSentAt },
-      };
-      bucket.push(assistantMessageRaw);
+      // Flip to streaming optimistically so the sidebar/input UI updates
+      // before the first SSE event lands. The 'streaming' tracker is what
+      // keeps the SSE alive across navigation.
+      runtime.isStreaming = true;
+      runtime.isSummarizing = false;
+      runtime.startedAt = Date.now();
 
-      // Get the reactive proxy reference so Vue detects mutations
-      const assistantMessage = bucket[bucket.length - 1];
+      // Make sure we're subscribed to events for this conversation BEFORE
+      // the POST returns; otherwise we could miss the first few events
+      // before the SSE handshake completes. The bus's start_run + ring
+      // buffer make this race-tolerant, but opening early avoids the
+      // replay-snapshot detour.
+      this.trackConversation(cid, 'streaming');
 
-      // Track timing milestones
-      let hasReceivedFirstEvent = false;
-      let errored = false;
+      // If we created a new conversation, also surface it as the active one
+      // and update the URL via the watcher in ChatView.vue. Add the
+      // 'active' tracker here too — the URL-watcher → switchConversation
+      // round-trip won't because it early-returns when activeConversationId
+      // already matches, leaving the stream held only by 'streaming'.
+      if (createdNew) {
+        this.activeConversationId = cid;
+        this.trackConversation(cid, 'active');
+      }
 
       try {
-        // Construct message payload
-        const messagePayload: Message = {
-          messageId: this.generateId(),
-          kind: 'message',
-          role: 'user',
-          parts: [{ kind: 'text', text } as Part],
-        };
-
-        // Add taskId and contextId if available for this conversation's runtime.
-        // For temp ids, contextId is initially undefined — backend assigns one.
-        if (runtime.currentTaskId) {
-          messagePayload.taskId = runtime.currentTaskId;
-        }
-        if (runtime.currentContextId) {
-          messagePayload.contextId = runtime.currentContextId;
-        }
-
-        const params: MessageSendParams = {
-          message: messagePayload,
-          metadata: {
-            reasoning: options?.reasoning !== false,
-          },
-        };
-
-        // Accumulate text tokens for display (token-by-token streaming)
-        let currentTextPart = '';
-
-        // Stream responses with retry (once) on error
-        const client = await getA2AClient();
-
-        let retried = false;
-        while (true) {
-          try {
-            for await (const event of client.sendMessageStream(params)) {
-              // Capture first event latency
-              if (!hasReceivedFirstEvent && assistantMessage.latency) {
-                assistantMessage.latency.firstEventAt = Date.now();
-                hasReceivedFirstEvent = true;
-              }
-
-              // Log only non-artifact events to reduce overhead during token streaming
-              if (event.kind !== 'artifact-update') {
-                console.log('Stream event:', event);
-              }
-
-              // Temp-id migration: as soon as the backend reveals a real
-              // contextId on this stream, swap our bucket key from `temp-…`
-              // to the real conversation id. The bucket array reference is
-              // preserved, so handlers keep mutating the right messages.
-              const eventContextId =
-                (event as any).contextId
-                ?? ((event as any).status?.contextId)
-                ?? undefined;
-              if (cid.startsWith('temp-') && eventContextId && typeof eventContextId === 'string') {
-                const realId = await this.migrateTempToReal(cid, eventContextId);
-                if (realId) cid = realId;
-              }
-
-              if (event.kind === 'status-update') {
-                this.handleStatusUpdate(event, assistantMessage, runtime);
-              } else if (event.kind === 'artifact-update') {
-                const updatedText = this.handleArtifactUpdate(event, assistantMessage, runtime, currentTextPart);
-                if (updatedText !== undefined) {
-                  currentTextPart = updatedText;
-                }
-              } else if (event.kind === 'message') {
-                this.handleMessageEvent(event as Message, assistantMessage, runtime);
-              } else if (event.kind === 'task') {
-                this.handleTaskEvent(event as Task, assistantMessage, runtime);
-              }
-            }
-            break; // Stream completed successfully
-          } catch (streamError: any) {
-            if (retried) {
-              throw streamError;
-            }
-            console.warn('Stream error, retrying with cleared context:', streamError);
-            retried = true;
-
-            // Clear this conversation's context/task and retry once
-            runtime.currentContextId = undefined;
-            runtime.currentTaskId = undefined;
-            delete messagePayload.contextId;
-            delete messagePayload.taskId;
-
-            currentTextPart = '';
-            hasReceivedFirstEvent = false;
-            assistantMessage.content = '';
-            assistantMessage.thinkingSteps = [];
-            assistantMessage.artifacts = [];
-            assistantMessage.latency = { requestSentAt: Date.now() };
-          }
-        }
-
-        // Capture completion latency
-        if (assistantMessage.latency) {
-          assistantMessage.latency.completedAt = Date.now();
-        }
-
-        // Finalize message
-        assistantMessage.isStreaming = false;
-
-        // Refresh conversation list so a brand-new conversation appears in the sidebar
-        // even if the temp→real migration didn't already trigger a fetch.
-        await this.loadConversations();
-
-      } catch (error: any) {
-        errored = true;
-        this.error = error.message || 'Failed to send message';
-        assistantMessage.content = `Error: ${this.error}`;
-        assistantMessage.isStreaming = false;
-        console.error('Error sending message:', error);
-      } finally {
+        const resp = await sendMessageRequest(
+          agentUrl,
+          authToken,
+          cid,
+          text,
+          options?.reasoning !== false,
+        );
+        runtime.currentTaskId = resp.run_id;
+      } catch (e: any) {
+        this.error = e?.message || 'Failed to send message';
         runtime.isStreaming = false;
-        runtime.isSummarizing = false;
-
-        // Push a notification if this conversation isn't the one the user is looking at.
-        if (cid !== this.activeConversationId) {
-          this.pushCompletionNotification(cid, assistantMessage, errored);
-        }
-      }
-    },
-
-    /**
-     * Look up the real conversation row matching `realContextId` and migrate
-     * the temp bucket / runtime under the real conversation id key. Returns
-     * the new key (real conversationId) on success, or undefined if the
-     * conversation row hasn't appeared yet.
-     */
-    async migrateTempToReal(tempId: string, realContextId: string): Promise<string | undefined> {
-      // Reload conversations to find the new row.
-      await this.loadConversations();
-      const conv = this.conversations.find(c => c.contextId === realContextId);
-      if (!conv) {
-        // Backend hasn't persisted it yet — leave as temp; we'll try again
-        // on the next event with a contextId.
-        return undefined;
-      }
-      const realId = conv.id;
-      if (realId === tempId) return realId;
-      if (this.messagesByConversation[realId]) {
-        // A bucket already exists under realId (unlikely). Merge by appending.
-        const tempBucket = this.messagesByConversation[tempId];
-        if (tempBucket) {
-          this.messagesByConversation[realId].push(...tempBucket);
-        }
-      } else {
-        this.messagesByConversation[realId] = this.messagesByConversation[tempId];
-      }
-      if (!this.runtimes[realId]) {
-        this.runtimes[realId] = this.runtimes[tempId];
-      }
-      delete this.messagesByConversation[tempId];
-      delete this.runtimes[tempId];
-      if (this.activeConversationId === tempId) {
-        this.activeConversationId = realId;
-      }
-      return realId;
-    },
-
-    /**
-     * Push a notification entry for a non-active conversation that just
-     * finished (or errored). Uses the conversation's title from the saved
-     * list; falls back to a generic label for unmigrated temp ids.
-     */
-    pushCompletionNotification(conversationId: string, assistantMessage: ChatMessage, errored: boolean) {
-      const settings = useSettingsStore();
-      const profile = settings.profileId;
-      if (!profile) return;
-      const conv = this.conversations.find(c => c.id === conversationId);
-      const title = conv?.title ?? 'New conversation';
-      const previewSource = errored
-        ? assistantMessage.content
-        : (assistantMessage.content || '(empty response)');
-      const preview = previewSource.slice(0, 80);
-      try {
-        useNotificationsStore().push(profile, {
+        this.untrackConversation(cid, 'streaming');
+        // Surface the failure inside the bucket so the user knows what
+        // happened without inspecting devtools.
+        bucket.push({
           id: this.generateId(),
-          conversationId,
-          conversationTitle: title,
-          messagePreview: preview,
-          kind: errored ? 'error' : 'completed',
-          createdAt: Date.now(),
-          seen: false,
+          role: 'assistant',
+          content: `Error: ${this.error}`,
+          parts: [],
+          timestamp: new Date(),
+          isStreaming: false,
         });
-      } catch (e) {
-        console.warn('Failed to push notification:', e);
+        console.error('sendMessage POST failed:', e);
       }
     },
 
@@ -489,276 +377,103 @@ export const useChatStore = defineStore('chat', {
       if (last?.role === 'assistant') {
         last.isStreaming = false;
       }
+      // Drop the 'streaming' tracker so the SSE can close (it will close
+      // unless 'active' or 'manual' trackers are still holding it).
+      this.untrackConversation(cid, 'streaming');
 
-      if (!taskId) {
-        return;
-      }
+      if (!taskId) return;
 
       try {
-        const token = useSettingsStore().authToken;
-        await fetch(`${getApiOrigin()}/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
-          method: 'POST',
-          headers: token ? { 'Authorization': `Bearer ${token}` } : {},
-        });
+        await cancelTask(useSettingsStore().agentUrl, useSettingsStore().authToken, taskId);
       } catch (e) {
+        // Fall back to plain fetch with token (cancelTask already uses fetch
+        // but throws on non-2xx; swallow to preserve old optimistic-cancel UX)
         console.warn('Cancel request failed', e);
-      }
-    },
-
-    /**
-     * Handle status update events
-     */
-    handleStatusUpdate(event: TaskStatusUpdateEvent, message: ChatMessage, runtime: ConversationRuntime) {
-      message.state = event.status.state;
-
-      if (event.taskId) {
-        runtime.currentTaskId = event.taskId;
-      }
-      if (event.contextId) {
-        runtime.currentContextId = event.contextId;
-      }
-
-      // Only extract text from status message if we don't already have
-      // content from artifact streaming (to avoid duplication)
-      if (event.status.message && !message.content) {
-        this.extractTextFromParts(event.status.message.parts, message);
-      }
-
-      // Clear task ID if final and not waiting for input
-      if (event.final && event.status.state !== 'input-required') {
-        console.log('Task completed, clearing task ID');
-        runtime.currentTaskId = undefined;
-      }
-    },
-
-    /**
-     * Handle artifact update events (thinking, result, token_usage, text tokens)
-     * Optimized for token-by-token streaming from "Text Response" artifacts
-     */
-    handleArtifactUpdate(
-      event: TaskArtifactUpdateEvent,
-      message: ChatMessage,
-      runtime: ConversationRuntime,
-      currentTextPart: string
-    ): string | undefined {
-      if (event.taskId) {
-        runtime.currentTaskId = event.taskId;
-      }
-      if (event.contextId) {
-        runtime.currentContextId = event.contextId;
-      }
-
-      const artifact = event.artifact;
-      if (!artifact || !artifact.parts) {
-        return undefined;
-      }
-
-      if (artifact.name === 'token') {
-        this.handleTokenArtifact(artifact.parts);
-        return undefined;
-      }
-
-      let foundContent = false;
-
-      for (const part of artifact.parts) {
-        if ('text' in part && typeof part.text === 'string') {
-          if (artifact.name === 'Text Response' || event.append) {
-            currentTextPart += part.text;
-
-            if (message.latency && !message.latency.firstTokenAt && part.text.length > 0) {
-              message.latency.firstTokenAt = Date.now();
-            }
-          } else {
-            currentTextPart = part.text;
-          }
-
-          message.content = this.buildMessageContent(message, currentTextPart);
-          foundContent = true;
-        }
-
-        if ('file' in part && typeof part.file === 'object' && part.file) {
-          const fileObj = part.file as any;
-          const attachment: FileAttachment = {
-            name: fileObj.name || 'file',
-            mimeType: fileObj.mimeType || fileObj.mime_type || 'application/octet-stream',
-            uri: fileObj.uri || '',
-          };
-          message.fileAttachments = message.fileAttachments || [];
-          message.fileAttachments.push(attachment);
-          message.content = this.buildMessageContent(message, currentTextPart);
-          foundContent = true;
-        }
-
-        if ('data' in part && typeof part.data === 'object') {
-          const data = part.data as any;
-
-          if (artifact.name === 'thinking') {
-            const stepReceivedAt = Date.now();
-            const thinkingStep: ThinkingStep = {
-              thought: data.Thought || '',
-              action: data.Action || '',
-              actionInput: data.Action_Input || '',
-              receivedAt: stepReceivedAt,
-              modelLabel: data.Model_Label || null,
-            };
-            message.thinkingSteps = message.thinkingSteps || [];
-            message.thinkingSteps.push(thinkingStep);
-
-            if (!message.reasoningModelLabel && data.Reasoning_Model_Label) {
-              message.reasoningModelLabel = data.Reasoning_Model_Label;
-            }
-
-            if (message.latency && !message.latency.firstStepAt) {
-              message.latency.firstStepAt = stepReceivedAt;
-            }
-
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          } else if (artifact.name === 'result') {
-            const observationParts: ObservationPart[] = Array.isArray(data.Observation)
-              ? data.Observation
-              : [{ kind: 'text', text: typeof data.Observation === 'string' ? data.Observation : JSON.stringify(data.Observation) }];
-            if (message.thinkingSteps && message.thinkingSteps.length > 0) {
-              const unresolvedStep = [...message.thinkingSteps]
-                .reverse()
-                .find(s => !s.observation);
-              if (unresolvedStep) {
-                unresolvedStep.observation = observationParts;
-              }
-            }
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          } else if (artifact.name === 'token_usage' && 'token_usage' in data) {
-            const usage = data.token_usage;
-            message.tokenUsage = {
-              inputTokens: usage.input_tokens || 0,
-              outputTokens: usage.output_tokens || 0,
-              totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
-            };
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          } else if (artifact.name === 'summary' && typeof data.summary === 'string') {
-            message.summary = data.summary;
-            runtime.isSummarizing = false;
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          } else if (artifact.name === 'phase' && typeof data.phase === 'string') {
-            console.log('[indicator] phase artifact received:', data.phase);
-            runtime.isSummarizing = data.phase === 'summarizing';
-            foundContent = true;
-          } else if (artifact.name === 'terminal' && typeof data.process_id === 'string') {
-            const attachment: TerminalAttachment = {
-              processId: data.process_id,
-              command: data.command || '',
-              commandShort: data.command_short || data.command || '',
-              workingDirectory: data.working_directory || '',
-              pty: Boolean(data.pty),
-            };
-            message.terminalAttachments = message.terminalAttachments || [];
-            if (!message.terminalAttachments.some(t => t.processId === attachment.processId)) {
-              message.terminalAttachments.push(attachment);
-            }
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          } else {
-            console.log('[indicator] generic data artifact:', { name: artifact.name, data });
-            const artifactInfo: ArtifactInfo = {
-              name: artifact.name || 'unknown',
-              artifactId: artifact.artifactId || this.generateId(),
-              type: 'data',
-              data,
-            };
-            message.artifacts = message.artifacts || [];
-            message.artifacts.push(artifactInfo);
-            message.content = this.buildMessageContent(message, currentTextPart);
-            foundContent = true;
-          }
-        }
-      }
-
-      return foundContent ? currentTextPart : undefined;
-    },
-
-    /**
-     * Handle token artifacts (save to localStorage)
-     */
-    handleTokenArtifact(parts: Part[]) {
-      for (const part of parts) {
-        if ('text' in part && typeof part.text === 'string') {
-          const token = part.text;
-          try {
-            localStorage.setItem(`a2a_agent_token_${this.agentName}`, token);
-            console.log(`Token saved for agent: ${this.agentName}`);
-          } catch (e) {
-            console.error('Failed to save token:', e);
-          }
+        try {
+          const token = useSettingsStore().authToken;
+          await fetch(`${getApiOrigin()}/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+            method: 'POST',
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+          });
+        } catch {
+          // already logged
         }
       }
     },
 
-    /**
-     * Handle message events from stream
-     */
-    handleMessageEvent(event: Message, message: ChatMessage, runtime: ConversationRuntime) {
-      if (event.taskId) {
-        runtime.currentTaskId = event.taskId;
-      }
-      if (event.contextId) {
-        runtime.currentContextId = event.contextId;
-      }
+    // ── stream lifecycle (ref-counted) ────────────────────────────────
 
-      this.extractTextFromParts(event.parts, message);
+    /**
+     * Add a tracker for the conversation's SSE subscription, opening it
+     * if this is the first tracker. Called whenever a reason arises to
+     * keep the stream alive: viewing the conversation ('active'), an
+     * in-flight run ('streaming'), or an explicit hold ('manual').
+     */
+    trackConversation(conversationId: string, reason: TrackReason) {
+      let scratch = streamScratch.get(conversationId);
+      if (!scratch) {
+        const settings = useSettingsStore();
+        const agentUrl = settings.agentUrl;
+        const authToken = settings.authToken;
+        if (!authToken) return;
+        const trackers = new Set<TrackReason>();
+        trackers.add(reason);
+        const init: StreamScratch = {
+          handle: { close: () => {} },
+          seqSeen: new Set<number>(),
+          currentTextPart: '',
+          trackers,
+        };
+        streamScratch.set(conversationId, init);
+        const handle = openConversationStream(
+          agentUrl,
+          authToken,
+          conversationId,
+          (event) => this.handleConversationStreamEvent(conversationId, event),
+          (err) => console.warn(`[chat] SSE error for ${conversationId}:`, err),
+        );
+        init.handle = handle;
+        return;
+      }
+      scratch.trackers.add(reason);
     },
 
     /**
-     * Handle task events from stream
+     * Drop a tracker; close the SSE subscription only when the last
+     * tracker is gone. Safe to call repeatedly.
      */
-    handleTaskEvent(event: Task, message: ChatMessage, runtime: ConversationRuntime) {
-      if (event.id) {
-        runtime.currentTaskId = event.id;
-      }
-      if (event.contextId) {
-        runtime.currentContextId = event.contextId;
-      }
-
-      message.state = event.status.state;
-
-      if (event.status.message) {
-        this.extractTextFromParts(event.status.message.parts, message);
+    untrackConversation(conversationId: string, reason: TrackReason) {
+      const scratch = streamScratch.get(conversationId);
+      if (!scratch) return;
+      scratch.trackers.delete(reason);
+      if (scratch.trackers.size === 0) {
+        try { scratch.handle.close(); } catch { /* ignore */ }
+        streamScratch.delete(conversationId);
       }
     },
 
     /**
-     * Extract text from parts and update message
+     * Force-close the SSE subscription regardless of trackers. Used on
+     * disconnect / profile switch / conversation delete.
      */
-    extractTextFromParts(parts: Part[], message: ChatMessage) {
-      for (const part of parts) {
-        if ('text' in part && typeof part.text === 'string') {
-          message.content += (message.content ? '\n' : '') + part.text;
-        }
-      }
+    forceCloseStream(conversationId: string) {
+      const scratch = streamScratch.get(conversationId);
+      if (!scratch) return;
+      try { scratch.handle.close(); } catch { /* ignore */ }
+      streamScratch.delete(conversationId);
     },
 
-    /**
-     * Build complete message content from all parts
-     * Combines streaming text tokens with thinking steps and results
-     */
-    buildMessageContent(_message: ChatMessage, currentTextPart: string): string {
-      return currentTextPart;
-    },
+    // ── connection management ─────────────────────────────────────────
 
-    /**
-     * Connect to the agent and load conversations
-     */
     async connect() {
       await this.fetchAgentCard();
       await this.loadConversations();
     },
 
-    /**
-     * Disconnect from the agent
-     */
     disconnect() {
+      for (const id of Array.from(streamScratch.keys())) {
+        this.forceCloseStream(id);
+      }
       this.isConnected = false;
       this.agentCard = null;
       this.agentName = 'Agent';
@@ -775,6 +490,9 @@ export const useChatStore = defineStore('chat', {
         if (this.runtimes[id].isStreaming) {
           await this.stopMessage(id);
         }
+      }
+      for (const id of Array.from(streamScratch.keys())) {
+        this.forceCloseStream(id);
       }
       this.messagesByConversation = {};
       this.runtimes = {};
@@ -794,7 +512,7 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Load conversations from backend API
+     * Load conversations from backend API.
      */
     async loadConversations() {
       try {
@@ -820,19 +538,32 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Switch to a saved conversation. If we already have an in-flight
-     * stream for it (or in-memory messages), keep them — otherwise fetch
-     * from the backend.
+     * Switch to a saved conversation. The previous conversation's stream
+     * stays open if it was streaming (a 'streaming' tracker holds it);
+     * only the 'active' tracker moves.
      */
     async switchConversation(id: string) {
-      if (id === this.activeConversationId) return;
+      const previousId = this.activeConversationId;
+
+      // Always re-affirm the 'active' tracker for the target id, even
+      // when it matches the current active conversation. This matters for
+      // the case where sendMessage created a brand-new conversation and
+      // set activeConversationId itself, then the URL watcher calls us
+      // back: without re-affirming, the conversation would have only a
+      // 'streaming' tracker and would lose its SSE the moment the run
+      // completes.
+      if (previousId && previousId !== id) {
+        this.untrackConversation(previousId, 'active');
+      }
+      this.trackConversation(id, 'active');
+
+      if (id === previousId) return;
 
       const hasBucket = !!this.messagesByConversation[id];
-      const isStreaming = !!this.runtimes[id]?.isStreaming;
 
-      if (hasBucket && isStreaming) {
-        // Don't refetch — backend hasn't persisted partial state yet, and we'd
-        // clobber the live stream's messages.
+      if (hasBucket) {
+        // Already have local state — don't refetch (would clobber the
+        // live stream's in-progress mutations).
         this.activeConversationId = id;
         this.error = null;
         useNotificationsStore().markSeenForConversation(useSettingsStore().profileId, id);
@@ -850,13 +581,311 @@ export const useChatStore = defineStore('chat', {
         const runtime = this.runtimes[id] ?? makeRuntime();
         runtime.currentTaskId = conversation.task_id ?? undefined;
         runtime.currentContextId = conversation.context_id ?? undefined;
-        // isStreaming stays as-is (false for a freshly-loaded conversation)
         this.runtimes[id] = runtime;
         this.activeConversationId = id;
         this.error = null;
         useNotificationsStore().markSeenForConversation(settingsStore.profileId, id);
       } catch (e) {
         console.error('Failed to switch conversation:', e);
+        // Roll back the tracker if we couldn't load the conversation.
+        this.untrackConversation(id, 'active');
+        if (previousId) this.trackConversation(previousId, 'active');
+      }
+    },
+
+    /**
+     * Apply a single SSE event from the conversation stream to the bucket.
+     * Mirrors the artifact handlers used by the user-typed message flow so
+     * Thinking Process, files, terminals, token usage, summary, and text
+     * tokens all render the same way.
+     *
+     * This handler runs for BOTH user-typed messages (once they POST) and
+     * skill-event-triggered runs — they go through the same backend path
+     * now and emit the same event vocabulary.
+     */
+    handleConversationStreamEvent(
+      conversationId: string,
+      event: ConversationStreamEvent,
+    ) {
+      const scratch = streamScratch.get(conversationId);
+      if (!scratch) return;
+      if (typeof event.seq === 'number') {
+        if (scratch.seqSeen.has(event.seq)) return;
+        scratch.seqSeen.add(event.seq);
+      }
+
+      const { bucket, runtime } = this.ensureBucket(conversationId);
+      const data = event.data ?? {};
+
+      const findAssistant = (): ChatMessage | null => {
+        const id = runtime.streamingAssistantId;
+        if (!id) return null;
+        for (let i = bucket.length - 1; i >= 0; i--) {
+          if (bucket[i].id === id) return bucket[i];
+        }
+        return null;
+      };
+
+      const ensureAssistant = (): ChatMessage => {
+        const existing = findAssistant();
+        if (existing) return existing;
+        const msg: ChatMessage = {
+          id: this.generateId(),
+          role: 'assistant',
+          content: '',
+          parts: [],
+          timestamp: new Date(),
+          isStreaming: true,
+          thinkingSteps: [],
+          artifacts: [],
+          latency: { requestSentAt: Date.now() },
+        };
+        bucket.push(msg);
+        runtime.streamingAssistantId = msg.id;
+        runtime.isStreaming = true;
+        runtime.startedAt = Date.now();
+        // Make sure the SSE stays open for the whole run — mostly redundant
+        // for runs we kicked off ourselves (sendMessage already sets this),
+        // but matters for skill-event runs we discover via the stream.
+        this.trackConversation(conversationId, 'streaming');
+        return bucket[bucket.length - 1];
+      };
+
+      switch (event.type) {
+        case 'ready':
+          // Pure synchronization marker between replay and live tail.
+          // Do NOT use is_active to clear runtime.isStreaming here: there
+          // is an unavoidable race where the SSE connects faster than the
+          // queue worker can call bus.start_run, so is_active arrives as
+          // false while a run is actually about to fire. Letting that
+          // false reading close the 'streaming' tracker would silently
+          // drop the entire run's events.
+          return;
+
+        case 'user_message': {
+          const id: string | undefined = data.id;
+          const content: string = data.content ?? '';
+          // Dedup against an optimistic user message we may have just pushed
+          // for our own POST: if the most recent user bubble has matching
+          // text, treat that bubble as the canonical one. Crucially we do
+          // NOT mutate its `id` — that would change ChatWindow's v-for key
+          // and force Vue to unmount/remount the bubble, flashing it in an
+          // unstyled position before the new element settles in.
+          const lastUserIdx = (() => {
+            for (let i = bucket.length - 1; i >= 0; i--) {
+              if (bucket[i].role === 'user') return i;
+              if (bucket[i].role === 'assistant') return -1;
+            }
+            return -1;
+          })();
+          const alreadyPresent =
+            (lastUserIdx >= 0 && bucket[lastUserIdx].content === content)
+            || (id !== undefined && bucket.some(m => m.id === id));
+          if (!alreadyPresent) {
+            bucket.push({
+              id: id ?? this.generateId(),
+              role: 'user',
+              content,
+              parts: [{ kind: 'text', text: content } as Part],
+              timestamp: new Date(),
+            });
+          }
+          // A new run is starting; reset stream-local state.
+          scratch.currentTextPart = '';
+          runtime.streamingAssistantId = undefined;
+          runtime.isStreaming = true;
+          this.trackConversation(conversationId, 'streaming');
+          return;
+        }
+
+        case 'thinking': {
+          const message = ensureAssistant();
+          const stepReceivedAt = Date.now();
+          const thinkingStep: ThinkingStep = {
+            thought: data.Thought || '',
+            action: data.Action || '',
+            actionInput: data.Action_Input || '',
+            receivedAt: stepReceivedAt,
+            modelLabel: data.Model_Label || null,
+          };
+          message.thinkingSteps = message.thinkingSteps || [];
+          message.thinkingSteps.push(thinkingStep);
+          if (!message.reasoningModelLabel && data.Reasoning_Model_Label) {
+            message.reasoningModelLabel = data.Reasoning_Model_Label;
+          }
+          if (message.latency && !message.latency.firstStepAt) {
+            message.latency.firstStepAt = stepReceivedAt;
+          }
+          return;
+        }
+
+        case 'result': {
+          const message = ensureAssistant();
+          const observationParts: ObservationPart[] = Array.isArray(data.Observation)
+            ? data.Observation
+            : [{
+                kind: 'text',
+                text: typeof data.Observation === 'string'
+                  ? data.Observation
+                  : JSON.stringify(data.Observation),
+              }];
+          if (message.thinkingSteps && message.thinkingSteps.length > 0) {
+            const unresolvedStep = [...message.thinkingSteps]
+              .reverse()
+              .find(s => !s.observation);
+            if (unresolvedStep) {
+              unresolvedStep.observation = observationParts;
+            }
+          }
+          return;
+        }
+
+        case 'text': {
+          const message = ensureAssistant();
+          const token: string = data.token ?? '';
+          if (!token) return;
+          scratch.currentTextPart += token;
+          message.content = scratch.currentTextPart;
+          if (message.latency && !message.latency.firstTokenAt) {
+            message.latency.firstTokenAt = Date.now();
+          }
+          return;
+        }
+
+        case 'file': {
+          const message = ensureAssistant();
+          const attachment: FileAttachment = {
+            name: data.name || data.file?.name || 'file',
+            mimeType:
+              data.mimeType
+              || data.mime_type
+              || data.file?.mimeType
+              || data.file?.mime_type
+              || 'application/octet-stream',
+            uri: data.uri || data.file?.uri || '',
+          };
+          message.fileAttachments = message.fileAttachments || [];
+          message.fileAttachments.push(attachment);
+          return;
+        }
+
+        case 'terminal': {
+          const message = ensureAssistant();
+          const attachment: TerminalAttachment = {
+            processId: data.process_id,
+            command: data.command || '',
+            commandShort: data.command_short || data.command || '',
+            workingDirectory: data.working_directory || '',
+            pty: Boolean(data.pty),
+          };
+          message.terminalAttachments = message.terminalAttachments || [];
+          if (!message.terminalAttachments.some(t => t.processId === attachment.processId)) {
+            message.terminalAttachments.push(attachment);
+          }
+          return;
+        }
+
+        case 'token_usage': {
+          const message = ensureAssistant();
+          const usage = data.token_usage ?? data;
+          message.tokenUsage = {
+            inputTokens: usage.input_tokens || 0,
+            outputTokens: usage.output_tokens || 0,
+            totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+          };
+          return;
+        }
+
+        case 'phase':
+          runtime.isSummarizing = data.phase === 'summarizing';
+          return;
+
+        case 'summary': {
+          const message = ensureAssistant();
+          if (typeof data.summary === 'string') {
+            message.summary = data.summary;
+          }
+          runtime.isSummarizing = false;
+          return;
+        }
+
+        case 'complete': {
+          const message = findAssistant();
+          if (message) {
+            message.isStreaming = false;
+            if (message.latency) message.latency.completedAt = Date.now();
+            // Deliberately do NOT mutate message.id to data.assistant_id:
+            // ChatWindow uses :key="message.id" for v-for, so changing it
+            // here forces Vue to unmount and remount the bubble — the user
+            // saw this as a flicker where the bubble briefly flashed in
+            // the top-left of the window before settling. The optimistic
+            // id is fine to keep for the lifetime of the session; the
+            // persisted DB id is only relevant on reload (where
+            // mapBackendMessage assigns it freshly).
+          }
+          runtime.isStreaming = false;
+          runtime.isSummarizing = false;
+          runtime.streamingAssistantId = undefined;
+          scratch.currentTextPart = '';
+          // Drop the 'streaming' tracker so the SSE can close when the
+          // user navigates away (it stays open as long as 'active' is set).
+          this.untrackConversation(conversationId, 'streaming');
+          // Refresh sidebar so the conversation surfaces / updates ordering.
+          this.loadConversations().catch(() => {});
+          // Push a notification if this conversation isn't the one the user
+          // is looking at (mirrors the legacy sendMessage finally clause).
+          if (conversationId !== this.activeConversationId && message) {
+            const errored = !!data.errored;
+            this.pushCompletionNotification(conversationId, message, errored);
+          }
+          return;
+        }
+
+        case 'error': {
+          const message = findAssistant();
+          if (message) {
+            const errText = data.message || 'event handling failed';
+            message.content = message.content
+              ? `${message.content}\n\n${errText}`
+              : errText;
+            message.isStreaming = false;
+          }
+          runtime.isStreaming = false;
+          runtime.isSummarizing = false;
+          runtime.streamingAssistantId = undefined;
+          scratch.currentTextPart = '';
+          this.untrackConversation(conversationId, 'streaming');
+          return;
+        }
+      }
+    },
+
+    /**
+     * Push a notification entry for a non-active conversation that just
+     * finished (or errored).
+     */
+    pushCompletionNotification(conversationId: string, assistantMessage: ChatMessage, errored: boolean) {
+      const settings = useSettingsStore();
+      const profile = settings.profileId;
+      if (!profile) return;
+      const conv = this.conversations.find(c => c.id === conversationId);
+      const title = conv?.title ?? 'New conversation';
+      const previewSource = errored
+        ? assistantMessage.content
+        : (assistantMessage.content || '(empty response)');
+      const preview = previewSource.slice(0, 80);
+      try {
+        useNotificationsStore().push(profile, {
+          id: this.generateId(),
+          conversationId,
+          conversationTitle: title,
+          messagePreview: preview,
+          kind: errored ? 'error' : 'completed',
+          createdAt: Date.now(),
+          seen: false,
+        });
+      } catch (e) {
+        console.warn('Failed to push notification:', e);
       }
     },
 
@@ -924,13 +953,15 @@ export const useChatStore = defineStore('chat', {
     },
 
     /**
-     * Switch to the empty "new chat" landing slot. Does not affect
-     * any in-flight streams in other conversations (or temp-id streams);
-     * they keep running in the background.
+     * Switch to the empty "new chat" landing slot. Background streams in
+     * other conversations keep running because their 'streaming' trackers
+     * still hold their SSE handles open.
      */
     switchToNewChat() {
+      const previousId = this.activeConversationId;
       this.activeConversationId = null;
       this.error = null;
+      if (previousId) this.untrackConversation(previousId, 'active');
     },
 
     /**
@@ -938,8 +969,10 @@ export const useChatStore = defineStore('chat', {
      * method so existing callers (App.vue) don't need to change semantics.
      */
     clearConversation() {
+      const previousId = this.activeConversationId;
       this.activeConversationId = null;
       this.error = null;
+      if (previousId) this.untrackConversation(previousId, 'active');
     },
 
     /**
@@ -950,6 +983,7 @@ export const useChatStore = defineStore('chat', {
       if (this.runtimes[id]?.isStreaming) {
         await this.stopMessage(id);
       }
+      this.forceCloseStream(id);
       try {
         const settingsStore = useSettingsStore();
         await apiDeleteConversation(settingsStore.agentUrl, settingsStore.authToken, id);
@@ -976,6 +1010,9 @@ export const useChatStore = defineStore('chat', {
         if (this.runtimes[id].isStreaming) {
           await this.stopMessage(id);
         }
+      }
+      for (const id of Array.from(streamScratch.keys())) {
+        this.forceCloseStream(id);
       }
       try {
         const settingsStore = useSettingsStore();

@@ -104,3 +104,55 @@ export async function updateConversationTitle(
   });
   if (!res.ok) throw new Error(`Failed to update conversation: ${res.statusText}`);
 }
+
+export async function createConversation(
+  agentUrl: string, authToken: string, title?: string,
+): Promise<ConversationSummary> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/conversations`, {
+    method: 'POST',
+    headers: authHeaders(authToken),
+    body: JSON.stringify({ title: title ?? 'Untitled Chat' }),
+  });
+  if (!res.ok) throw new Error(`Failed to create conversation: ${res.statusText}`);
+  const data = await res.json();
+  return { ...data.conversation, message_count: 0 };
+}
+
+export interface SendMessageResponse {
+  run_id: string;
+  conversation_id: string;
+}
+
+export async function sendMessageRequest(
+  agentUrl: string,
+  authToken: string,
+  conversationId: string,
+  text: string,
+  reasoning: boolean = true,
+): Promise<SendMessageResponse> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+    {
+      method: 'POST',
+      headers: authHeaders(authToken),
+      body: JSON.stringify({ text, reasoning }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to send message: ${res.statusText}`);
+  return res.json();
+}
+
+export async function cancelTask(
+  agentUrl: string, authToken: string, taskId: string,
+): Promise<boolean> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: 'POST',
+    headers: authHeaders(authToken),
+  });
+  if (!res.ok) throw new Error(`Failed to cancel task: ${res.statusText}`);
+  const data = await res.json();
+  return Boolean(data.cancelled);
+}

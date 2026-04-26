@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, computed, watch } from 'vue';
+import { onMounted, onBeforeUnmount, computed, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElNotification } from 'element-plus';
 import { Icon } from '@iconify/vue';
@@ -46,6 +46,10 @@ onMounted(async () => {
     } catch (e) {
       router.replace({ name: 'chat', params: { profile: props.profile } });
     }
+  } else if (chatStore.activeConversationId) {
+    // Re-attach the 'active' tracker after a previous unmount (e.g. user
+    // came back from Settings to the same conversation). Idempotent.
+    chatStore.trackConversation(chatStore.activeConversationId, 'active');
   }
 });
 
@@ -74,6 +78,14 @@ watch(() => chatStore.activeConversationId, (newId) => {
   } else if (!newId && currentRouteConvId) {
     router.replace({ name: 'chat', params: { profile: props.profile } });
   }
+});
+
+// Drop the 'active' tracker on unmount so navigating to Settings doesn't
+// keep an idle SSE open. Any 'streaming' tracker (live run in flight) keeps
+// the connection alive on its own — this only releases the view's hold.
+onBeforeUnmount(() => {
+  const id = chatStore.activeConversationId;
+  if (id) chatStore.untrackConversation(id, 'active');
 });
 
 const handleConnect = async () => {

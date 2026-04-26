@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { ElBadge, ElPopover, ElSwitch, ElTooltip } from 'element-plus';
@@ -8,6 +8,7 @@ import { useChatStore } from '../stores/chat';
 import { useNotificationsStore } from '../stores/notifications';
 import AgentCard from './AgentCard.vue';
 import NotificationList from './NotificationList.vue';
+import { openNotificationsStream, type NotificationStreamHandle } from '../services/notificationsStream';
 
 const route = useRoute();
 const router = useRouter();
@@ -15,8 +16,35 @@ const settingsStore = useSettingsStore();
 const chatStore = useChatStore();
 const notificationsStore = useNotificationsStore();
 
+let notificationsStream: NotificationStreamHandle | null = null;
+
 onMounted(() => {
   notificationsStore.hydrate();
+  if (!settingsStore.authToken || !settingsStore.profileId) return;
+  const profileId = settingsStore.profileId;
+  notificationsStream = openNotificationsStream(
+    settingsStore.agentUrl,
+    settingsStore.authToken,
+    Date.now(),
+    (entry) => {
+      notificationsStore.push(profileId, {
+        id: entry.id,
+        conversationId: entry.conversation_id,
+        conversationTitle: entry.conversation_title,
+        messagePreview: entry.message_preview,
+        kind: entry.kind,
+        createdAt: entry.created_at,
+        seen: false,
+      });
+    },
+  );
+});
+
+onBeforeUnmount(() => {
+  if (notificationsStream !== null) {
+    notificationsStream.close();
+    notificationsStream = null;
+  }
 });
 
 const bellPopoverVisible = ref(false);
@@ -76,6 +104,12 @@ const handleOpenProcessManager = () => {
   const profile = route.params.profile as string;
   if (!profile) return;
   router.push({ name: 'process-list', params: { profile } });
+};
+
+const handleOpenEvents = () => {
+  const profile = route.params.profile as string;
+  if (!profile) return;
+  router.push({ name: 'skill-events', params: { profile } });
 };
 
 const handleLogout = () => {
@@ -279,6 +313,13 @@ const toggleThemeFromIcon = () => {
         <div class="settings-row" @click="handleOpenProcessManager">
           <Icon icon="mdi:console" class="settings-icon" />
           <span class="settings-label" v-if="!isCollapsed">Process Manager</span>
+          <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
+        </div>
+      </ElTooltip>
+      <ElTooltip content="Events" placement="right" :show-after="300" :disabled="!isCollapsed">
+        <div class="settings-row" @click="handleOpenEvents">
+          <Icon icon="mdi:lightning-bolt-outline" class="settings-icon" />
+          <span class="settings-label" v-if="!isCollapsed">Events</span>
           <Icon icon="mdi:chevron-right" class="chevron-icon" v-if="!isCollapsed" />
         </div>
       </ElTooltip>

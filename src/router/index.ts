@@ -77,6 +77,13 @@ const routes = [
     component: () => import('../views/ProcessTerminal.vue'),
     props: true,
   },
+  // Skill Events — conversation-scoped event subscriptions
+  {
+    path: '/:profile/events',
+    name: 'skill-events',
+    component: () => import('../views/SkillEventsPage.vue'),
+    props: true,
+  },
 ];
 
 const router = createRouter({
