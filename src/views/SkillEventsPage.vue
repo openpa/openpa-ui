@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   ElButton,
@@ -18,13 +18,15 @@ import { useSettingsStore } from '../stores/settings';
 import { useChatStore } from '../stores/chat';
 import {
   deleteSubscription,
-  getListenerStatus,
-  listSubscriptions,
   simulateEvent,
   startListener,
   type ListenerStatus,
   type SkillEventSubscription,
 } from '../services/skillEventsApi';
+import {
+  openSkillEventsAdminStream,
+  type SkillEventsAdminStreamHandle,
+} from '../services/skillEventsAdminStream';
 
 const props = defineProps<{ profile: string }>();
 const router = useRouter();
@@ -45,40 +47,62 @@ const sortedSubs = computed(() =>
   [...subscriptions.value].sort((a, b) => b.created_at - a.created_at),
 );
 
-async function refresh() {
-  if (!settings.authToken) return;
+let streamHandle: SkillEventsAdminStreamHandle | null = null;
+
+function streamStart() {
+  streamStop();
+  if (!settings.agentUrl || !settings.authToken) return;
   loading.value = true;
   errorMessage.value = '';
-  try {
-    const data = await listSubscriptions(settings.agentUrl, settings.authToken);
-    subscriptions.value = data.subscriptions;
-    const skills = Array.from(new Set(data.subscriptions.map(s => s.skill_name)));
-    const statuses = await Promise.all(
-      skills.map(async name => {
-        try {
-          return await getListenerStatus(settings.agentUrl, settings.authToken, name);
-        } catch {
-          return null;
-        }
-      }),
-    );
-    const next: Record<string, ListenerStatus> = {};
-    statuses.forEach(s => {
-      if (s) next[s.skill_name] = s;
-    });
-    listenerByName.value = next;
-  } catch (err) {
-    errorMessage.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    loading.value = false;
+  streamHandle = openSkillEventsAdminStream(
+    settings.agentUrl,
+    settings.authToken,
+    (snap) => {
+      subscriptions.value = snap.subscriptions;
+      listenerByName.value = snap.listeners;
+      loading.value = false;
+      errorMessage.value = '';
+    },
+    (err) => {
+      errorMessage.value = err instanceof Error ? err.message : String(err);
+      loading.value = false;
+    },
+  );
+}
+
+function streamStop() {
+  if (streamHandle) {
+    streamHandle.close();
+    streamHandle = null;
   }
+}
+
+// Force-reconnect the stream — used by the header's Refresh button as a
+// belt-and-braces "I don't trust the live state" escape hatch. Action
+// handlers below don't need to call this; the backend pushes a fresh
+// snapshot whenever a subscription mutates or a listener starts.
+function refresh() {
+  streamStart();
 }
 
 onMounted(() => {
   if (!settings.authToken && props.profile) {
     settings.activateProfile(props.profile);
   }
-  void refresh();
+  streamStart();
+});
+
+watch(
+  () => settings.authToken,
+  (token, prev) => {
+    if (token && !prev) {
+      streamStart();
+    }
+  },
+);
+
+onBeforeUnmount(() => {
+  streamStop();
 });
 
 function goBack() {
@@ -102,7 +126,6 @@ async function confirmDelete(row: SkillEventSubscription) {
   try {
     await deleteSubscription(settings.agentUrl, settings.authToken, row.id);
     ElMessage.success('Subscription deleted');
-    await refresh();
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : String(err));
   }
@@ -152,7 +175,6 @@ async function startListenerFor(skillName: string) {
   try {
     await startListener(settings.agentUrl, settings.authToken, skillName);
     ElMessage.success(`${skillName} listener started`);
-    await refresh();
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : String(err));
   }

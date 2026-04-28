@@ -27,24 +27,24 @@ onMounted(() => {
   if (!settings.authToken && props.profile) {
     settings.activateProfile(props.profile);
   }
-  // Kick off the initial fetch and start 5s polling; the backend is the
-  // source of truth for multi-tab consistency.
-  store.pollStart(5000);
+  // Open the SSE stream; the first frame is a snapshot, subsequent frames
+  // arrive on every state transition (spawn / exit / stop / autostart).
+  store.streamStart();
 });
 
 // If the token becomes available after mount (auth gate finished async),
-// trigger a refresh so the list populates without waiting for the next poll.
+// (re)open the stream so the list populates without manual reload.
 watch(
   () => settings.authToken,
   (token, prev) => {
     if (token && !prev) {
-      void store.refresh();
+      store.streamStart();
     }
   },
 );
 
 onBeforeUnmount(() => {
-  store.pollStop();
+  store.streamStop();
 });
 
 const exitedCount = computed(

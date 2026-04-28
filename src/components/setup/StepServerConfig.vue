@@ -14,6 +14,7 @@ const form = ref({
   service_name: props.config.service_name || 'openpa-agent',
   agent_name: props.config.agent_name || 'OPENPA Agent',
   working_dir: props.config.working_dir || '~/.openpa',
+  user_working_dir: props.config.user_working_dir || '~/Documents',
   sqlite_db_path: props.config.sqlite_db_path || 'openpa.db',
 });
 
@@ -40,13 +41,17 @@ onMounted(() => {
       <ElFormItem label="Agent Display Name">
         <ElInput v-model="form.agent_name" placeholder="OPENPA Agent" />
       </ElFormItem>
-      <ElFormItem label="Working Directory">
+      <ElFormItem label="OpenPA System Directory">
         <ElInput v-model="form.working_dir" placeholder="~/.openpa" />
-        <div class="field-hint">Base directory for profiles, storage, and data files.</div>
+        <div class="field-hint">Internal storage for profiles, skills, persona, and tool state.</div>
+      </ElFormItem>
+      <ElFormItem label="User Working Directory">
+        <ElInput v-model="form.user_working_dir" placeholder="~/Documents" />
+        <div class="field-hint">Default active path for all tools. Created on first run if missing.</div>
       </ElFormItem>
       <ElFormItem label="Database Name">
         <ElInput v-model="form.sqlite_db_path" placeholder="openpa.db" />
-        <div class="field-hint">SQLite database filename, stored inside the working directory.</div>
+        <div class="field-hint">SQLite database filename, stored inside the OpenPA system directory.</div>
       </ElFormItem>
     </ElForm>
 
