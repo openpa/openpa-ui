@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import { ElBadge, ElPopover, ElSwitch, ElTooltip } from 'element-plus';
@@ -20,32 +20,66 @@ let notificationsStream: NotificationStreamHandle | null = null;
 
 onMounted(() => {
   notificationsStore.hydrate();
-  if (!settingsStore.authToken || !settingsStore.profileId) return;
-  const profileId = settingsStore.profileId;
-  notificationsStream = openNotificationsStream(
-    settingsStore.agentUrl,
-    settingsStore.authToken,
-    Date.now(),
-    (entry) => {
-      notificationsStore.push(profileId, {
-        id: entry.id,
-        conversationId: entry.conversation_id,
-        conversationTitle: entry.conversation_title,
-        messagePreview: entry.message_preview,
-        kind: entry.kind,
-        createdAt: entry.created_at,
-        seen: false,
-      });
-    },
-  );
 });
 
-onBeforeUnmount(() => {
+// Open the notifications stream reactively to auth state. The Sidebar mounts
+// before App.vue's onMounted finishes activating the profile on direct page
+// load, so a one-shot onMounted subscription would silently abort with no
+// authToken and never retry. Watching the auth deps with immediate:true
+// fires once on mount (returning early if no token yet) and again the moment
+// the token becomes available, so server-triggered runs (skill events) can
+// reach the sidebar even when the user navigated straight to a deep link.
+const closeNotificationsStream = () => {
   if (notificationsStream !== null) {
     notificationsStream.close();
     notificationsStream = null;
   }
-});
+};
+
+watch(
+  () => [settingsStore.authToken, settingsStore.profileId] as const,
+  ([token, profileId]) => {
+    closeNotificationsStream();
+    if (!token || !profileId) return;
+    notificationsStream = openNotificationsStream(
+      settingsStore.agentUrl,
+      token,
+      Date.now(),
+      (entry) => {
+        console.log('[debug:notif] received entry', {
+          kind: entry.kind,
+          conversation_id: entry.conversation_id,
+          id: entry.id,
+          created_at: entry.created_at,
+        });
+        // Server-triggered runs (skill events) have no client POST that
+        // would open the per-conversation SSE. The 'started' kind exists so
+        // the sidebar can lazily open that SSE and the streaming-dot lights
+        // up even for conversations the user has never visited this session.
+        if (entry.kind === 'started') {
+          console.log('[debug:notif] handling started for', entry.conversation_id);
+          const { runtime } = chatStore.ensureBucket(entry.conversation_id);
+          runtime.isStreaming = true;
+          runtime.startedAt = Date.now();
+          chatStore.trackConversation(entry.conversation_id, 'streaming');
+          return;
+        }
+        notificationsStore.push(profileId, {
+          id: entry.id,
+          conversationId: entry.conversation_id,
+          conversationTitle: entry.conversation_title,
+          messagePreview: entry.message_preview,
+          kind: entry.kind,
+          createdAt: entry.created_at,
+          seen: false,
+        });
+      },
+    );
+  },
+  { immediate: true },
+);
+
+onBeforeUnmount(closeNotificationsStream);
 
 const bellPopoverVisible = ref(false);
 

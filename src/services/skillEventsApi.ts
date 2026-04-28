@@ -56,7 +56,7 @@ export interface EventNotificationEntry {
   conversation_id: string;
   conversation_title: string;
   message_preview: string;
-  kind: 'completed' | 'error';
+  kind: 'started' | 'completed' | 'error';
   created_at: number;
 }
 

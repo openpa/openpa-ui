@@ -415,7 +415,11 @@ export const useChatStore = defineStore('chat', {
         const settings = useSettingsStore();
         const agentUrl = settings.agentUrl;
         const authToken = settings.authToken;
-        if (!authToken) return;
+        if (!authToken) {
+          console.log('[debug:track] aborting open: no authToken', { conversationId, reason });
+          return;
+        }
+        console.log('[debug:track] opening NEW SSE', { conversationId, reason });
         const trackers = new Set<TrackReason>();
         trackers.add(reason);
         const init: StreamScratch = {
@@ -435,6 +439,11 @@ export const useChatStore = defineStore('chat', {
         init.handle = handle;
         return;
       }
+      console.log('[debug:track] reusing SSE, adding tracker', {
+        conversationId,
+        reason,
+        existingTrackers: Array.from(scratch.trackers),
+      });
       scratch.trackers.add(reason);
     },
 

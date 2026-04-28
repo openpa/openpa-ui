@@ -59,10 +59,12 @@ export function openConversationStream(
         const headers: Record<string, string> = { Accept: 'text/event-stream' };
         if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
+        console.log('[debug:convstream] fetching', { url, conversationId });
         const res = await fetch(url, { headers, signal: controller.signal });
         if (!res.ok || !res.body) {
           throw new Error(`SSE failed: ${res.status} ${res.statusText}`);
         }
+        console.log('[debug:convstream] connected', { conversationId, status: res.status });
         attempt = 0;
 
         const reader = res.body.getReader();
@@ -101,6 +103,11 @@ export function openConversationStream(
 
             try {
               const payload = JSON.parse(dataLines.join('\n')) as ConversationStreamEvent;
+              console.log('[debug:convstream] frame', {
+                conversationId,
+                seq: payload.seq,
+                type: payload.type,
+              });
               onEvent(payload);
             } catch (err) {
               console.warn('[conversationStream] bad frame:', dataLines, err);

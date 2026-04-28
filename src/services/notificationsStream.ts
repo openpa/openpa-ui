@@ -49,10 +49,12 @@ export function openNotificationsStream(
         const headers: Record<string, string> = { Accept: 'text/event-stream' };
         if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
+        console.log('[debug:notifstream] fetching', { url });
         const res = await fetch(url, { headers, signal: controller.signal });
         if (!res.ok || !res.body) {
           throw new Error(`SSE failed: ${res.status} ${res.statusText}`);
         }
+        console.log('[debug:notifstream] connected', { status: res.status });
         attempt = 0;
 
         const reader = res.body.getReader();
@@ -88,6 +90,7 @@ export function openNotificationsStream(
 
             try {
               const payload = JSON.parse(dataLines.join('\n')) as NotificationFrame;
+              console.log('[debug:notifstream] frame', { type: payload.type });
               if (payload.type === 'notification') {
                 const entry = payload.data as EventNotificationEntry;
                 cursor = Math.max(cursor, entry.created_at);
