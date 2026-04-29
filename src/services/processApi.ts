@@ -41,8 +41,8 @@ export interface ProcessRow {
   exit_code: number | null;
   /** Unix seconds (wall clock) when the process was created. */
   created_at: number;
-  /** Unix seconds (wall clock) when the registry entry will expire. */
-  expire_at: number;
+  /** Unix seconds (wall clock) when the registry entry will expire; null = never expires (autostart-linked). */
+  expire_at: number | null;
   is_pty: boolean;
   /** Autostart registration id; null when the process is not registered. */
   autostart_id: string | null;
@@ -177,6 +177,44 @@ export async function registerAutostart(
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.message || data.error || `Failed to register: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export interface SkillLongRunningAppResult {
+  process_id: string;
+  autostart_id: string;
+  command: string;
+  working_dir: string;
+}
+
+export async function registerSkillLongRunningApp(
+  agentUrl: string,
+  token: string,
+  toolId: string,
+  force = false,
+): Promise<SkillLongRunningAppResult> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(
+    `${base}/api/tools/${encodeURIComponent(toolId)}/long-running-app/register`,
+    {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: JSON.stringify({ force }),
+    },
+  );
+  if (res.status === 409) {
+    const data = await res.json().catch(() => ({}));
+    throw new DuplicateAutostartError(
+      data.existing,
+      data.message || 'A registration with the same command already exists.',
+    );
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(
+      data.message || data.error || `Failed to register: ${res.statusText}`,
+    );
   }
   return res.json();
 }

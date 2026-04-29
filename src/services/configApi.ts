@@ -340,6 +340,10 @@ export interface ToolStatus {
   connection_error?: string | null;
   /** Built-in tools only: false until a child LLM is bound (post-setup). */
   llm_bound?: boolean;
+  /** Skills only: declared in SKILL.md frontmatter as
+   *  ``metadata.long_running_app`` -- a helper process the skill wants
+   *  registered for autostart. Absent when the skill doesn't declare one. */
+  long_running_app?: { command: string; description?: string };
 }
 
 export async function listTools(

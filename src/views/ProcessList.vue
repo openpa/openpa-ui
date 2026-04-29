@@ -96,7 +96,8 @@ function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
-function formatRelativeExpiry(ts: number): string {
+function formatRelativeExpiry(ts: number | null): string {
+  if (ts === null) return 'never';
   if (!ts) return '—';
   const diffMs = ts * 1000 - Date.now();
   if (diffMs <= 0) return 'expired';

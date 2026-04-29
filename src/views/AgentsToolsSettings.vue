@@ -3,10 +3,11 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   ElCard, ElForm, ElFormItem, ElInput,
-  ElButton, ElMessage, ElDialog, ElDivider,
+  ElButton, ElMessage, ElMessageBox, ElDialog, ElDivider,
   ElRadioGroup, ElRadioButton,
 } from 'element-plus';
 import { Icon } from '@iconify/vue';
+import { RouterLink } from 'vue-router';
 import { useSettingsStore, type ProfileValue } from '../stores/settings';
 import {
   listAgents, addAgent, removeAgent, updateAgentConfig,
@@ -16,6 +17,9 @@ import {
   getSkillMode, setSkillMode,
   type RemoteAgentInfo, type ToolStatus, type LLMProvider, type SkillMode,
 } from '../services/configApi';
+import {
+  registerSkillLongRunningApp, DuplicateAutostartError,
+} from '../services/processApi';
 
 type LLMDefaultField =
   | 'description'
@@ -76,6 +80,13 @@ interface UnifiedItem {
   /** Code-level defaults from TOOL_CONFIG.llm_parameters (placeholders only).
    *  Empty for skills / MCP / A2A — those don't ship code defaults. */
   llmDefaults: NonNullable<ToolStatus['llm_defaults']>;
+  /** Skills only: declared ``long_running_app`` block; null when absent. */
+  longRunningApp: { command: string; description?: string } | null;
+  /** Transient: true while a Register Long-Running Process click is in flight. */
+  registering: boolean;
+  /** Transient: most recent successful registration result, used to render
+   *  the inline confirmation card with a link to the process detail page. */
+  lastRegisteredProcess: { process_id: string; command: string } | null;
 }
 
 // ── Data ──
@@ -232,6 +243,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       // Skills don't have a child LLM; treat them as bound.
       llmBound: isSkill ? true : (tool.llm_bound ?? true),
       llmDefaults,
+      longRunningApp: tool.long_running_app ?? null,
+      registering: false,
+      lastRegisteredProcess: null,
     });
   }
 
@@ -271,6 +285,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       saving: false,
       llmBound: true,
       llmDefaults: {},
+      longRunningApp: null,
+      registering: false,
+      lastRegisteredProcess: null,
     });
   }
 
@@ -306,6 +323,9 @@ function buildUnifiedItems(agents: RemoteAgentInfo[], tools: ToolStatus[]) {
       saving: false,
       llmBound: true,
       llmDefaults: {},
+      longRunningApp: null,
+      registering: false,
+      lastRegisteredProcess: null,
     });
   }
 
@@ -523,6 +543,47 @@ async function reloadAll() {
 
 function goBack() { router.push(`/${props.profile}/settings`); }
 
+async function registerLongRunningApp(item: UnifiedItem) {
+  if (!item.toolName || !item.longRunningApp) return;
+  item.registering = true;
+  try {
+    await doRegisterLongRunningApp(item, false);
+  } catch (err) {
+    if (err instanceof DuplicateAutostartError) {
+      try {
+        await ElMessageBox.confirm(
+          `A long-running process with this command is already registered:\n\n${err.existing.command}\n\nRegister another copy anyway?`,
+          'Duplicate registration',
+          { confirmButtonText: 'Register again', cancelButtonText: 'Cancel', type: 'warning' },
+        );
+      } catch {
+        item.registering = false;
+        return;
+      }
+      try {
+        await doRegisterLongRunningApp(item, true);
+      } catch (err2) {
+        ElMessage.error(err2 instanceof Error ? err2.message : String(err2));
+      }
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : String(err));
+    }
+  } finally {
+    item.registering = false;
+  }
+}
+
+async function doRegisterLongRunningApp(item: UnifiedItem, force: boolean) {
+  const result = await registerSkillLongRunningApp(
+    settingsStore.agentUrl, settingsStore.authToken, item.toolName!, force,
+  );
+  item.lastRegisteredProcess = {
+    process_id: result.process_id,
+    command: result.command,
+  };
+  ElMessage.success('Process registered and started');
+}
+
 async function onSkillModeChange(value: string | number | boolean | undefined) {
   const next = value as SkillMode;
   const previous: SkillMode = next === 'manual' ? 'automatic' : 'manual';
@@ -674,6 +735,38 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
                     @update:values="item.toolConfigValues = $event"
                   />
                   <ElButton type="primary" size="small" :loading="item.saving" @click="saveItemConfig(item)">Save</ElButton>
+                </div>
+
+                <div v-if="item.longRunningApp" class="config-section lra-section">
+                  <h4 class="config-section-title">Register Long-Running Process</h4>
+                  <p v-if="item.longRunningApp.description" class="lra-description">
+                    {{ item.longRunningApp.description }}
+                  </p>
+                  <pre class="lra-command">{{ item.longRunningApp.command }}</pre>
+                  <ElButton
+                    type="primary"
+                    size="small"
+                    :loading="item.registering"
+                    @click="registerLongRunningApp(item)"
+                  >
+                    <Icon icon="mdi:play-circle-outline" />&nbsp;Register Process
+                  </ElButton>
+                  <div v-if="item.lastRegisteredProcess" class="lra-result">
+                    <Icon icon="mdi:check-circle" class="lra-result-icon" />
+                    <span>
+                      Process started:
+                      <RouterLink
+                        class="lra-link"
+                        :to="{
+                          name: 'process-terminal',
+                          params: { profile: props.profile, pid: item.lastRegisteredProcess.process_id },
+                        }"
+                      >
+                        {{ item.lastRegisteredProcess.process_id }}
+                      </RouterLink>
+                      — open the detail page to view logs and send input.
+                    </span>
+                  </div>
                 </div>
               </div>
             </ElCard>
@@ -930,6 +1023,43 @@ async function onSkillModeChange(value: string | number | boolean | undefined) {
 .empty-args { color: var(--text-tertiary); font-size: 0.8rem; padding: 4px 0 12px 0; }
 .empty-state { color: var(--text-tertiary); font-size: 0.85rem; padding: 16px 0; }
 .add-btn { margin-top: 8px; }
+
+.lra-description {
+  margin: 0 0 8px 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.lra-command {
+  margin: 0 0 10px 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.8rem;
+  background: var(--surface-color);
+  border: 1px solid var(--border-color, #e4e7ed);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.lra-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+  background: #f0f9eb;
+  border: 1px solid #c2e7b0;
+  border-radius: 4px;
+  color: #1f3a1f;
+}
+[data-theme="dark"] .lra-result {
+  background: rgba(52, 211, 153, 0.14);
+  border-color: rgba(52, 211, 153, 0.45);
+  color: var(--text-primary);
+}
+.lra-result-icon { color: var(--success-color, #67c23a); flex-shrink: 0; margin-top: 2px; }
+.lra-link { color: var(--primary-color, #409eff); text-decoration: underline; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.lra-link:hover { color: var(--primary-color-hover, #66b1ff); }
 
 .skill-mode-row {
   display: flex;
