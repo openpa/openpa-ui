@@ -20,6 +20,12 @@ const settingsCards = [
     route: 'tools-skills',
   },
   {
+    title: 'Config',
+    description: 'Tune agent reasoning, history limits, classifier and summarizer parameters',
+    icon: 'mdi:tune',
+    route: 'config',
+  },
+  {
     title: 'Profiles',
     description: 'Manage user profiles and reconfigure the system',
     icon: 'mdi:account-group',

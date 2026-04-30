@@ -109,6 +109,102 @@ export async function updateServerConfig(
   return res.json();
 }
 
+// ── User Config (Settings → Config) ──
+
+export type UserConfigFieldType = 'number' | 'string' | 'boolean' | 'enum';
+
+export interface UserConfigField {
+  type: UserConfigFieldType;
+  default?: unknown;
+  label?: string;
+  description?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  enum?: string[];
+}
+
+export interface UserConfigGroup {
+  label: string;
+  description?: string;
+  fields: Record<string, UserConfigField>;
+}
+
+export interface UserConfigSchema {
+  groups: Record<string, UserConfigGroup>;
+}
+
+export interface UserConfigValues {
+  profile: string;
+  values: Record<string, unknown>;
+  defaults: Record<string, unknown>;
+}
+
+export async function getUserConfigSchema(
+  agentUrl: string,
+  token: string
+): Promise<UserConfigSchema> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/config/schema`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to get config schema: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getUserConfig(
+  agentUrl: string,
+  token: string,
+  profile: string
+): Promise<UserConfigValues> {
+  const base = resolveBaseUrl(agentUrl);
+  const params = `?profile=${encodeURIComponent(profile)}`;
+  const res = await fetch(`${base}/api/config/user${params}`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Failed to get user config: ${res.statusText}`);
+  return res.json();
+}
+
+export async function updateUserConfig(
+  agentUrl: string,
+  token: string,
+  profile: string,
+  values: Record<string, unknown>
+): Promise<{ success: boolean; updated: string[] }> {
+  const base = resolveBaseUrl(agentUrl);
+  const res = await fetch(`${base}/api/config/user`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify({ profile, values }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const detail = data.details ? ` (${JSON.stringify(data.details)})` : '';
+    throw new Error(`${data.error || 'Failed to update user config'}${detail}`);
+  }
+  return res.json();
+}
+
+export async function resetUserConfigKey(
+  agentUrl: string,
+  token: string,
+  profile: string,
+  key: string
+): Promise<{ success: boolean; deleted: boolean }> {
+  const base = resolveBaseUrl(agentUrl);
+  const params = `?profile=${encodeURIComponent(profile)}`;
+  const res = await fetch(
+    `${base}/api/config/user/${encodeURIComponent(key)}${params}`,
+    {
+      method: 'DELETE',
+      headers: authHeaders(token),
+    }
+  );
+  if (!res.ok) throw new Error(`Failed to reset config key: ${res.statusText}`);
+  return res.json();
+}
+
 // ── LLM Providers ──
 
 export interface ProviderConfigField {

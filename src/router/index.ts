@@ -59,6 +59,12 @@ const routes = [
     props: true,
   },
   {
+    path: '/:profile/settings/config',
+    name: 'user-config-settings',
+    component: () => import('../views/UserConfigSettings.vue'),
+    props: true,
+  },
+  {
     path: '/:profile/settings/profiles',
     name: 'profile-settings',
     component: () => import('../views/ProfileSettings.vue'),

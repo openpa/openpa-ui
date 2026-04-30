@@ -14,6 +14,8 @@ declare module 'vue' {
     AgentCard: typeof import('./src/components/AgentCard.vue')['default']
     AgentsDrawer: typeof import('./src/components/AgentsDrawer.vue')['default']
     ChatWindow: typeof import('./src/components/ChatWindow.vue')['default']
+    ConfigFieldRow: typeof import('./src/components/config/ConfigFieldRow.vue')['default']
+    ConfigGroupCard: typeof import('./src/components/config/ConfigGroupCard.vue')['default']
     ItemCardHeader: typeof import('./src/components/shared/ItemCardHeader.vue')['default']
     LLMParametersForm: typeof import('./src/components/shared/LLMParametersForm.vue')['default']
     MessageBubble: typeof import('./src/components/MessageBubble.vue')['default']
